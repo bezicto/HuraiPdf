@@ -1,0 +1,86 @@
+# Kata hubung gabungan (coordinating conjunctions)
+dan
+atau
+tetapi
+serta
+lalu
+lagi
+malah
+bahkan
+sebaliknya
+kecuali
+
+# Kata hubung pancangan nama (nominal subordinating)
+bahawa
+
+# Kata hubung pancangan keterangan — tujuan
+agar
+supaya
+bagi
+demi
+untuk
+
+# Kata hubung pancangan keterangan — sebab
+kerana
+sebab
+
+# Kata hubung pancangan keterangan — syarat
+jika
+kalau
+sekiranya
+andai
+andainya
+andaikata
+kecuali
+
+# Kata hubung pancangan keterangan — konsesi
+walaupun
+meskipun
+sungguhpun
+biarpun
+kendatipun
+
+# Kata hubung pancangan keterangan — waktu
+sebelum
+sesudah
+setelah
+semasa
+ketika
+apabila
+manakala
+sehingga
+hingga
+sejak
+
+# Kata hubung pancangan keterangan — cara / keadaan
+sambil
+seraya
+
+# Kata hubung pancangan keterangan — perbandingan
+seperti
+bagaikan
+ibarat
+seolah
+seolah-olah
+
+# Kata hubung pancangan keterangan — pengecualian / pertentangan
+melainkan
+mahupun
+namun
+sedangkan
+padahal
+
+# Partikel dan kata penegas (particles / emphatics often negligible)
+yang
+ini
+itu
+tersebut
+tadi
+begitu
+begini
+demikian
+juga
+pun
+lah
+kah
+tah

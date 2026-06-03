@@ -1,0 +1,6 @@
+/uploads/*
+!/uploads/.gitkeep
+/output/*
+!/output/.gitkeep
+.DS_Store
+**/.DS_Store
