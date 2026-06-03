@@ -4,3 +4,5 @@
 !/output/.gitkeep
 .DS_Store
 **/.DS_Store
+/uploads/
+/output/
