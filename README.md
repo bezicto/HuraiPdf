@@ -141,6 +141,34 @@ In the included web interface, select **Exclude numbers/digits from the final
 output** before uploading the PDF. The choice is also saved as
 `exclude_numbers` in the generated JSON metadata.
 
+#### Optionally preserve line breaks
+
+Pass `preserveLineBreaks: true` to keep lines and paragraph gaps while filtering:
+
+```php
+$text = "Invoice 2026\nBatch42Code\n\nRoom7";
+
+$filter->filter($text);
+// "invoice 2026 batch42code room7"
+
+$filter->filter($text, preserveLineBreaks: true);
+// "invoice 2026\nbatch42code\n\nroom7"
+
+$filter->filter($text, excludeNumbers: true, preserveLineBreaks: true);
+// "invoice\nbatch code\n\nroom"
+```
+
+This optional third parameter defaults to `false` on both `filter()` and
+`filterChunks()`, preserving existing behavior. When enabled, CRLF and CR become
+LF, three or more consecutive newlines become two, and leading/trailing empty
+lines are removed. A line containing only removed tokens becomes an empty line.
+`filterChunks()` still yields chunks separately with their original keys.
+
+In the web interface, select **Preserve line breaks** beside the numbers/digits
+checkbox. The option applies to the preview and downloaded text, separates
+retained pages with a blank line, and is saved as `preserve_line_breaks` in the
+JSON metadata. The checkbox is unchecked by default.
+
 ---
 
 ## API Reference

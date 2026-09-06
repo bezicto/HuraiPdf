@@ -35,10 +35,12 @@ ini_set('memory_limit', (string) min($maxMemoryBytes ?? 512 * 1024 * 1024, 512 *
 $errorMessage = '';
 $result = null;
 $excludeNumbers = false;
+$preserveLineBreaks = false;
 $createdFiles = [];
 if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
     try {
         $excludeNumbers = ($_POST['exclude_numbers'] ?? '') === '1';
+        $preserveLineBreaks = ($_POST['preserve_line_breaks'] ?? '') === '1';
         $uploadedFile = $_FILES['pdf_file'] ?? null;
         if (!is_array($uploadedFile) || ($uploadedFile['error'] ?? UPLOAD_ERR_NO_FILE) !== UPLOAD_ERR_OK) {
             throw new InvalidArgumentException('Upload failed. Check the file size and server upload limits.');
@@ -84,10 +86,11 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
         // extractFile() calls this function for each page without retaining the whole document.
         // Use $page->getText() directly instead of filter() for unfiltered text.
         try {
-            $extraction = $parser->extractFile($tmpPath, static function ($page) use ($filter, $handle, $excludeNumbers, &$textLength, &$preview): void {
-                $filtered = $filter->filter($page->getText(), $excludeNumbers);
+            $extraction = $parser->extractFile($tmpPath, static function ($page) use ($filter, $handle, $excludeNumbers, $preserveLineBreaks, &$textLength, &$preview): void {
+                $filtered = $filter->filter($page->getText(), $excludeNumbers, $preserveLineBreaks);
                 if ($filtered === '') { return; }
-                $chunk = ($textLength > 0 ? ' ' : '') . $filtered;
+                $separator = $preserveLineBreaks ? "\n\n" : ' ';
+                $chunk = ($textLength > 0 ? $separator : '') . $filtered;
                 if (strlen($chunk) > MAX_OUTPUT_BYTES - $textLength) {
                     throw PdfParseException::resourceLimitExceeded('Output exceeds the configured text limit.');
                 }
@@ -103,6 +106,7 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
             'source_original_name' => $originalName,
             'extracted_at_utc' => gmdate(DATE_ATOM), 'engine' => 'HuraiPdf/Parser',
             'from_page' => $fromPage, 'to_page' => $toPage, 'exclude_numbers' => $excludeNumbers,
+            'preserve_line_breaks' => $preserveLineBreaks,
             'text_length' => $textLength, 'performance' => $extraction['metrics'],
         ];
         writeAllFile($metaPath . '.part', json_encode($meta, JSON_PRETTY_PRINT | JSON_INVALID_UTF8_SUBSTITUTE | JSON_THROW_ON_ERROR));
@@ -116,6 +120,7 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'POST') {
             'text_file' => 'output/' . $name . '.txt',
             'meta_file' => 'output/' . $name . '.json',
             'exclude_numbers' => $excludeNumbers, 'warnings' => $metadata['warnings'],
+            'preserve_line_breaks' => $preserveLineBreaks,
             'preview' => $preview, 'preview_truncated' => $textLength > strlen($preview),
         ];
     } catch (Throwable $exception) {
@@ -217,6 +222,11 @@ function writeAllFile(string $path, string $data): void
             <input name="exclude_numbers" type="checkbox" value="1"<?php echo $excludeNumbers ? ' checked' : ''; ?>>
             Exclude numbers/digits from the final output
         </label>
+        &nbsp;
+        <label>
+            <input name="preserve_line_breaks" type="checkbox" value="1"<?php echo $preserveLineBreaks ? ' checked' : ''; ?>>
+            Preserve line breaks
+        </label>
         <br><br>
         <button type="submit">Upload and Extract</button>
     </form>
@@ -230,6 +240,7 @@ function writeAllFile(string $path, string $data): void
         <p>Source PDF: <?php echo htmlspecialchars($result['source_pdf'], ENT_QUOTES, 'UTF-8'); ?></p>
         <p>Pages parsed: <?php echo htmlspecialchars($result['page_range'], ENT_QUOTES, 'UTF-8'); ?></p>
         <p>Numbers/digits excluded: <?php echo $result['exclude_numbers'] ? 'Yes' : 'No'; ?></p>
+        <p>Line breaks preserved: <?php echo $result['preserve_line_breaks'] ? 'Yes' : 'No'; ?></p>
         <p>Text output: <a href="<?php echo htmlspecialchars($result['text_file'], ENT_QUOTES, 'UTF-8'); ?>"><?php echo htmlspecialchars($result['text_file'], ENT_QUOTES, 'UTF-8'); ?></a></p>
         <p>Meta output: <a href="<?php echo htmlspecialchars($result['meta_file'], ENT_QUOTES, 'UTF-8'); ?>"><?php echo htmlspecialchars($result['meta_file'], ENT_QUOTES, 'UTF-8'); ?></a></p>
 

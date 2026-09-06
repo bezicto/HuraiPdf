@@ -34,10 +34,10 @@ final class StopWordFilter
     }
 
     /**
-     * Remove stopwords from the given text and return a space-separated
-     * string of remaining tokens, suitable for keyword indexing.
+     * Remove stopwords and return space-separated tokens by default.
+     * Optionally retain line boundaries and up to one blank line between paragraphs.
      */
-    public function filter(string $text, bool $excludeNumbers = false): string
+    public function filter(string $text, bool $excludeNumbers = false, bool $preserveLineBreaks = false): string
     {
         if ($text === '') {
             return '';
@@ -47,6 +47,21 @@ final class StopWordFilter
         $separatorPattern = $excludeNumbers
             ? self::LETTER_SEPARATOR_PATTERN
             : self::TOKEN_SEPARATOR_PATTERN;
+        if (!$preserveLineBreaks) {
+            return $this->filterTokens($text, $separatorPattern);
+        }
+
+        $lines = explode("\n", str_replace(["\r\n", "\r"], "\n", $text));
+        foreach ($lines as $index => $line) {
+            $lines[$index] = $this->filterTokens($line, $separatorPattern);
+        }
+        $result = implode("\n", $lines);
+        $result = preg_replace('/\n{3,}/', "\n\n", $result) ?? $result;
+        return trim($result, "\n");
+    }
+
+    private function filterTokens(string $text, string $separatorPattern): string
+    {
         $tokens = preg_split($separatorPattern, strtolower($text), -1, PREG_SPLIT_NO_EMPTY);
         if ($tokens === false) {
             return $text;
@@ -70,10 +85,10 @@ final class StopWordFilter
      * @param iterable<int|string, string> $chunks
      * @return \Generator<int|string, string>
      */
-    public function filterChunks(iterable $chunks, bool $excludeNumbers = false): \Generator
+    public function filterChunks(iterable $chunks, bool $excludeNumbers = false, bool $preserveLineBreaks = false): \Generator
     {
         foreach ($chunks as $key => $chunk) {
-            $filtered = $this->filter($chunk, $excludeNumbers);
+            $filtered = $this->filter($chunk, $excludeNumbers, $preserveLineBreaks);
             if ($filtered !== '') {
                 yield $key => $filtered;
             }
