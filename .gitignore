@@ -2,6 +2,7 @@
 /output/
 /vendor/
 /.phpunit.result.cache
+/test/
 .DS_Store
 **/.DS_Store
 phpunit.xml.dist
