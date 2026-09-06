@@ -6,6 +6,7 @@
     "require": {
         "php": ">=8.3 <8.6",
         "ext-ctype": "*",
+        "ext-openssl": "*",
         "ext-zlib": "*"
     },
     "suggest": {

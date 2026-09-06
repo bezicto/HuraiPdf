@@ -7,6 +7,17 @@ namespace HuraiPdf;
 /** @internal Mutable state that is deliberately scoped to one parse operation. */
 final class ParseContext
 {
+    /** @var (\Closure(int, bool): bool)|null */
+    public ?\Closure $objectLoader = null;
+    public ?Security\StandardSecurityHandler $security = null;
+    public ?int $encryptionObjectId = null;
+    /** @var array<int, int> */
+    public array $objectGenerations = [];
+    /** @var array<string, string> */
+    public array $trailerEntries = [];
+    public string $password = '';
+    public bool $isDecrypted = false;
+    public Metadata\DocumentInfo $documentInfo;
     /** @var array<int, array{map:array<string,string>,max_code_bytes:int,encoding_name:string,differences:array<int,string>,is_multibyte:bool,has_tounicode:bool}> */
     public array $fontMapCache = [];
 
@@ -28,10 +39,12 @@ final class ParseContext
     /** @var array<string, array<string, int>> */
     public array $resourceXObjectMapsCache = [];
 
-    /** @var array{pdf_version:string,is_encrypted:bool,warnings:string[],page_count:int} */
+    /** @var array{pdf_version:string,is_encrypted:bool,is_decrypted:bool,details:array<string,string>,warnings:string[],page_count:int} */
     public array $metadata = [
         'pdf_version' => 'unknown',
         'is_encrypted' => false,
+        'is_decrypted' => false,
+        'details' => [],
         'warnings' => [],
         'page_count' => 0,
     ];
@@ -67,13 +80,24 @@ final class ParseContext
 
     public function __construct()
     {
+        $this->documentInfo = new Metadata\DocumentInfo();
         memory_reset_peak_usage();
         $this->startedAtNanoseconds = hrtime(true);
     }
 
     public function finish(): void
     {
+        $this->password = '';
+        $this->security = null;
         $this->metrics['duration_ms'] = (hrtime(true) - $this->startedAtNanoseconds) / 1_000_000;
         $this->metrics['peak_memory_bytes'] = memory_get_peak_usage(true);
+        $this->objectLoader = null;
+        // Release large allocations immediately, including when a generator is
+        // closed early. The service graph may await PHP's cycle collector.
+        foreach (['fontMapCache', 'decodedStreamCache', 'resourceBodiesCache',
+            'expandedObjectStreams', 'formTextCache', 'resourceFontMapsCache',
+            'resourceXObjectMapsCache', 'objectGenerations', 'trailerEntries'] as $cache) {
+            $this->$cache = [];
+        }
     }
 }

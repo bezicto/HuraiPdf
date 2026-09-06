@@ -14,7 +14,8 @@ final class Document
         private readonly array $pages,
         private readonly string $pdfVersion,
         private readonly bool $encrypted,
-        private readonly array $warnings
+        private readonly array $warnings,
+        private readonly Metadata\DocumentInfo|array $details = [],
     ) {
     }
 
@@ -65,8 +66,23 @@ final class Document
             }
         }
 
-        return trim(implode(' ', $chunks));
+        return trim(implode("\n\n", $chunks));
     }
+
+    /** @return array<string, string> */
+    public function getDetails(): array
+    {
+        return $this->details instanceof Metadata\DocumentInfo ? $this->details->getDetails() : $this->details;
+    }
+
+    public function getTitle(): ?string { return $this->getDetails()['Title'] ?? null; }
+    public function getAuthor(): ?string { return $this->getDetails()['Author'] ?? null; }
+    public function getSubject(): ?string { return $this->getDetails()['Subject'] ?? null; }
+    public function getKeywords(): ?string { return $this->getDetails()['Keywords'] ?? null; }
+    public function getCreator(): ?string { return $this->getDetails()['Creator'] ?? null; }
+    public function getProducer(): ?string { return $this->getDetails()['Producer'] ?? null; }
+    public function getCreationDate(): ?string { return $this->getDetails()['CreationDate'] ?? null; }
+    public function getModDate(): ?string { return $this->getDetails()['ModDate'] ?? null; }
 
     /**
      * Yields retained page text without constructing one combined string.

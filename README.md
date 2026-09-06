@@ -8,7 +8,9 @@ A zero-dependency, pure-PHP PDF text extraction library compatible with PHP 8.3,
 
 - Extract text from PDF files or raw PDF string content
 - Per-page text access with page numbers and PDF object IDs
-- PDF metadata: version, page count, encryption status
+- Preserves text line breaks and separates pages with blank lines
+- PDF metadata: version, page count, encryption/decryption status, and standard `/Info` fields
+- Opens Standard-encrypted PDFs with blank passwords (security revisions 2–6)
 - Handles common stream encodings: Flate/Deflate, LZW, ASCII-85, ASCII-Hex, Run-Length
 - Font support: ToUnicode CMaps, standard/PDF encodings, glyph name resolution
 - Built-in web interface (`index.php`) for quick upload-and-extract testing
@@ -19,7 +21,7 @@ A zero-dependency, pure-PHP PDF text extraction library compatible with PHP 8.3,
 ## Requirements
 
 - PHP **8.3, 8.4, or 8.5**
-- PHP extensions: `ctype` and `zlib`
+- PHP extensions: `ctype`, `zlib`, and `openssl`
 - Recommended: `mbstring` or `iconv` for legacy font encoding conversion
 
 ---
@@ -195,7 +197,7 @@ process memory guarantee. Size limits should fit the worker's PHP memory limit;
 retain an external worker time/memory limit for untrusted files. Individual native
 library calls cannot be interrupted midway by the parser's deadline.
 
-#### `parseFile(string $filePath, int $fromPage = 1, ?int $toPage = null): Document`
+#### `parseFile(string $filePath, int $fromPage = 1, ?int $toPage = null, ?string $password = ''): Document`
 
 Reads and parses a PDF file from disk.
 
@@ -204,6 +206,7 @@ Reads and parses a PDF file from disk.
 | `$filePath` | `string` | — | Absolute or relative path to the PDF file |
 | `$fromPage` | `int` | `1` | First page to parse (1-based) |
 | `$toPage` | `int\|null` | `null` | Last page to parse (inclusive). `null` means parse to the end |
+| `$password` | `string\|null` | `''` | Password to try; `null` also means an empty password |
 
 ```php
 // Parse entire PDF
@@ -224,7 +227,7 @@ Throws `PdfParseException` if:
 - `$fromPage` is less than `1`
 - `$toPage` is less than `$fromPage`
 
-#### `parseContent(string $content, int $fromPage = 1, ?int $toPage = null): Document`
+#### `parseContent(string $content, int $fromPage = 1, ?int $toPage = null, ?string $password = ''): Document`
 
 Parses a PDF from a string (e.g. from a database column, HTTP response, or `file_get_contents()`).
 
@@ -233,6 +236,7 @@ Parses a PDF from a string (e.g. from a database column, HTTP response, or `file
 | `$content` | `string` | — | Raw PDF binary string |
 | `$fromPage` | `int` | `1` | First page to parse (1-based) |
 | `$toPage` | `int\|null` | `null` | Last page to parse (inclusive). `null` means parse to the end |
+| `$password` | `string\|null` | `''` | Password to try; `null` also means an empty password |
 
 ```php
 $pdfContent = file_get_contents('https://example.com/file.pdf');
@@ -285,8 +289,10 @@ echo $metrics['decoded_bytes'];
 echo $metrics['duration_ms'];
 ```
 
-`getLastMetadata()` returns `pdf_version`, `is_encrypted`, `warnings`, and the
-number of pages actually emitted. Metadata and metrics are finalized even when a
+`getLastMetadata()` returns `pdf_version`, `is_encrypted`, `is_decrypted`,
+`details`, `warnings`, and `page_count` (the number of pages actually emitted).
+`details` contains standard `/Info` keys such as `Title` and `Author`.
+Metadata and metrics are finalized even when a
 page generator is destroyed early. If you break out of a loop while retaining the
 generator variable, `unset($generator)` releases it.
 
@@ -314,13 +320,51 @@ Returned by both parser methods. Holds all extracted data.
 
 | Method | Return type | Description |
 |---|---|---|
-| `getText(?int $pageLimit = null)` | `string` | Concatenated text from all pages. Pass an integer to limit how many pages are included. |
+| `getText(?int $pageLimit = null)` | `string` | Page text joined with `"\n\n"`. Pass an integer to limit how many pages are included. |
 | `getTextGenerator(?int $pageLimit = null)` | `Generator<int, string>` | Yields retained page text without building a combined string. Use `Parser::parseFilePages()` for incremental parsing. |
 | `getPages()` | `Page[]` | Array of all `Page` objects |
 | `getPageCount()` | `int` | Total number of pages extracted |
 | `getPdfVersion()` | `string` | PDF version string (e.g. `"1.4"`, `"1.7"`, or `"unknown"`) |
-| `isEncrypted()` | `bool` | `true` if the PDF has an encryption dictionary |
+| `isEncrypted()` | `bool` | `true` if encryption prevented authentication and extraction |
 | `getWarnings()` | `string[]` | Non-fatal issues encountered during parsing |
+| `getDetails()` | `array<string, string>` | Decoded standard `/Info` entries; absent keys are omitted |
+| `getTitle()`, `getAuthor()`, `getSubject()`, `getKeywords()` | `?string` | Corresponding `/Info` text, or `null` when absent |
+| `getCreator()`, `getProducer()` | `?string` | Application metadata, or `null` when absent |
+| `getCreationDate()`, `getModDate()` | `?string` | ISO-8601 date, raw malformed date, or `null` when absent |
+
+Horizontal whitespace is collapsed per line, trailing spaces are removed, and
+three or more newlines become two. Line breaks follow PDF text operators; this
+preserves rows and paragraphs but does not reconstruct geometric table columns.
+Dates without an explicit timezone retain an unspecified timezone. Partial PDF
+dates default missing month/day to January/1 and missing time fields to zero.
+
+### Passwords and decryption
+
+All four entry points accept an optional trailing `?string $password = ''`,
+including `parseFilePages()` and `extractFile()`. Existing calls remain valid.
+
+```php
+$document = $parser->parseFile('permissions-only.pdf'); // tries the blank password
+$document = $parser->parseFile('protected.pdf', password: 'secret');
+echo $document->getTitle();
+$metadata = $parser->getLastMetadata();
+// Successful decryption: is_encrypted=false, is_decrypted=true.
+```
+
+The Standard handler supports RC4 (R2/R3/R4), AES-128 (R4), and AES-256 (R5/R6),
+with independent stream/string crypt filters and user/owner authentication.
+OpenSSL handles AES and available RC4 ciphers; a bounded native PHP fallback
+handles RC4 when OpenSSL's legacy provider is unavailable. Host OpenSSL settings
+are never changed. Xref streams, the encryption dictionary, and plaintext
+metadata streams are exempt where required by the PDF format. Strings within
+object streams are decrypted only as part of their container.
+
+An incorrect password, unsupported handler, or invalid encryption parameters
+produce an encrypted document with the existing warning and no extracted pages.
+Blank and ASCII passwords are supported. Non-ASCII legacy passwords must use the
+original password bytes; non-ASCII R5/R6 passwords must already be prepared UTF-8
+(the library does not implement SASLprep normalization). Image extraction and OCR
+remain out of scope.
 
 #### Examples
 
@@ -484,7 +528,7 @@ you expect to process.
 ## Limitations
 
 - **Scanned / image-only PDFs** — No OCR is performed. PDFs that contain only scanned images will return empty or minimal text.
-- **Encrypted / password-protected PDFs** — Encrypted PDFs are detected and flagged via `isEncrypted()`, but decryption is not supported. Text extraction will likely be empty or fail.
+- **Unsupported encryption** — Public-key/custom security handlers and passwords that fail authentication return an encrypted result with a warning and no pages.
 - **Complex layouts** — Multi-column documents, tables, and positioned glyphs may differ in reading order, spacing, and word grouping from a visual PDF reader.
 - **Inline images** — Common unfiltered/Flate/ASCII85/ASCIIHex/RunLength/LZW/JPEG boundaries are handled. Ambiguous or unsupported image boundaries cause a warning and skip the remaining content stream rather than interpret binary bytes as text.
 - **Prototype status** — This is an evolving prototype. Edge cases in the PDF specification may not be handled.
@@ -498,7 +542,7 @@ you expect to process.
 ├── index.php                          # Standalone upload-and-extract example
 ├── src/
 │   └── HuraiPdf/
-│       ├── Parser.php                 # Main parsing engine
+│       ├── Parser.php                 # Lifecycle and page-extraction coordinator
 │       ├── ParserOptions.php          # Tunable thresholds passed to Parser
 │       ├── ParseContext.php            # Per-operation caches, counters, and metadata
 │       ├── Document.php               # Parsed document container
@@ -506,11 +550,29 @@ you expect to process.
 │       ├── PdfObject.php              # Internal typed value object for PDF indirect objects
 │       ├── Exception/
 │       │   └── PdfParseException.php  # Custom exception
-│       └── Filter/
-|           └── stopwords/             # all stop words each in own language files .txt
-│           └── StopWordFilter.php     # Stopword filter
+│       ├── Reader/                    # Xref/object loading and page-tree traversal
+│       ├── Content/                   # Content interpreter and resource resolution
+│       ├── Font/                      # CMaps, glyphs, and fixed encoding tables
+│       ├── Security/                  # Standard security handler, R2–R6
+│       ├── Metadata/                  # DocumentInfo decoding and dates
+│       ├── Internal/                  # Operation services, syntax, and budgets
+│       └── Filter/                    # StreamDecoder, Predictor, StopWordFilter
+│           └── stopwords/             # Language-specific word lists
+├── tests/                             # Dependency-free PHP regression suite
 └── composer.json                      # Library metadata and PSR-4 autoloading
 ```
+
+## Verification
+
+Run `php tests/run.php`. CI lints source and tests and runs the suite on PHP 8.3,
+8.4, and 8.5, including a run with optional encoding functions disabled. The suite
+covers layout, metadata, security revisions 2–6, encrypted object streams,
+incremental and hybrid xrefs, forward xref chains, streaming cleanup, image
+skipping, filters, predictors, fonts, and resource budgets.
+
+Synthetic encrypted fixtures are committed in `tests/fixtures/`. Their optional
+regeneration script uses development-only Python tooling; see
+[tests/README.md](tests/README.md). Running the tests requires only PHP.
 
 ---
 
