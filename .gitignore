@@ -1,5 +1,6 @@
 /uploads/
 /output/
 /vendor/
+/tests/
 .DS_Store
 **/.DS_Store

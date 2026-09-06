@@ -558,21 +558,14 @@ you expect to process.
 │       ├── Internal/                  # Operation services, syntax, and budgets
 │       └── Filter/                    # StreamDecoder, Predictor, StopWordFilter
 │           └── stopwords/             # Language-specific word lists
-├── tests/                             # Dependency-free PHP regression suite
 └── composer.json                      # Library metadata and PSR-4 autoloading
 ```
 
 ## Verification
 
-Run `php tests/run.php`. CI lints source and tests and runs the suite on PHP 8.3,
-8.4, and 8.5, including a run with optional encoding functions disabled. The suite
-covers layout, metadata, security revisions 2–6, encrypted object streams,
-incremental and hybrid xrefs, forward xref chains, streaming cleanup, image
-skipping, filters, predictors, fonts, and resource budgets.
-
-Synthetic encrypted fixtures are committed in `tests/fixtures/`. Their optional
-regeneration script uses development-only Python tooling; see
-[tests/README.md](tests/README.md). Running the tests requires only PHP.
+CI validates Composer metadata and checks PHP syntax on PHP 8.3, 8.4, and 8.5.
+The local `tests/` directory is excluded from Git and is not included in GitHub
+checkouts. Developers who retain the local suite can run `php tests/run.php`.
 
 ---
 

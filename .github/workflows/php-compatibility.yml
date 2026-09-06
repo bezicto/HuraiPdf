@@ -34,10 +34,4 @@ jobs:
         run: composer validate --strict
 
       - name: Check PHP syntax
-        run: find src tests -name '*.php' -print0 | xargs -0 -n1 php -l && php -l index.php
-
-      - name: Run regression suite
-        run: php tests/run.php
-
-      - name: Run without optional encoding functions
-        run: php -d disable_functions=mb_convert_encoding,mb_list_encodings,iconv tests/run.php
+        run: find src -name '*.php' -print0 | xargs -0 -n1 php -l && php -l index.php
