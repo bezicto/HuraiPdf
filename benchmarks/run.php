@@ -20,6 +20,7 @@ if (is_file($composerAutoload)) {
     });
 }
 
+use HuraiPdf\Filter\StopWordFilter;
 use HuraiPdf\Parser;
 use HuraiPdf\ParserOptions;
 use HuraiPdf\Tests\Support\PdfFixtureFactory;
@@ -71,4 +72,23 @@ try {
     );
 } finally {
     @unlink($path);
+}
+
+$filter = new StopWordFilter();
+$filterInput = str_repeat('Invoice 123456 Batch42Code total 99.95 reference Room7 ', 20_000);
+$filterIterations = 20;
+foreach ([false, true] as $excludeNumbers) {
+    $started = hrtime(true);
+    $filtered = '';
+    for ($iteration = 0; $iteration < $filterIterations; $iteration++) {
+        $filtered = $filter->filter($filterInput, $excludeNumbers);
+    }
+    $elapsed = (hrtime(true) - $started) / 1_000_000;
+    printf(
+        "filter numbers %s: %.2f ms average, %d input bytes, %d output bytes\n",
+        $excludeNumbers ? 'excluded' : 'retained',
+        $elapsed / $filterIterations,
+        strlen($filterInput),
+        strlen($filtered)
+    );
 }

@@ -44,6 +44,7 @@ ini_set('memory_limit', $memoryLimit);
 
 $errorMessage = '';
 $result = null;
+$excludeNumbers = false;
 
 if (!is_dir($outputDir)) {
     mkdir($outputDir, 0775, true);
@@ -54,6 +55,8 @@ if (!is_dir($uploadDir)) {
 }
 
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    $excludeNumbers = (string) ($_POST['exclude_numbers'] ?? '') === '1';
+
     if (!isset($_FILES['pdf_file'])) {
         $errorMessage = 'No file uploaded.';
     } else {
@@ -153,11 +156,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                                 static function ($page) use (
                                     $stopWordFilter,
                                     $textHandle,
+                                    $excludeNumbers,
                                     &$textLength,
                                     &$preview,
                                     &$hasWrittenText
                                 ): void {
-                                    $filtered = $stopWordFilter->filter($page->getText());
+                                    $filtered = $stopWordFilter->filter($page->getText(), $excludeNumbers);
                                     if ($filtered === '') {
                                         return;
                                     }
@@ -189,6 +193,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                                 'page_count' => $metadata['page_count'],
                                 'from_page' => $fromPage,
                                 'to_page' => $toPage,
+                                'exclude_numbers' => $excludeNumbers,
                                 'is_encrypted' => $metadata['is_encrypted'],
                                 'warnings' => $metadata['warnings'],
                                 'text_length' => $textLength,
@@ -213,6 +218,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                             'meta_file' => 'output/' . basename($metaOutputPath),
                             'engine' => 'HuraiPdf/Parser',
                             'engines_tried' => ['HuraiPdf/Parser'],
+                            'exclude_numbers' => $excludeNumbers,
                             'warnings' => $metadata['warnings'],
                             'preview' => $preview,
                             'preview_truncated' => $textLength > strlen($preview),
@@ -354,6 +360,11 @@ function writeAllFile(string $path, string $data): void
         <label for="to_page">To page (optional):</label>
         <input id="to_page" name="to_page" type="number" min="1" value="<?php echo htmlspecialchars((string) ($_POST['to_page'] ?? ''), ENT_QUOTES, 'UTF-8'); ?>">
         <br><br>
+        <label>
+            <input name="exclude_numbers" type="checkbox" value="1"<?php echo $excludeNumbers ? ' checked' : ''; ?>>
+            Exclude numbers/digits from the final output
+        </label>
+        <br><br>
         <button type="submit">Upload and Extract</button>
     </form>
 
@@ -367,6 +378,7 @@ function writeAllFile(string $path, string $data): void
         <p>Pages parsed: <?php echo htmlspecialchars($result['page_range'], ENT_QUOTES, 'UTF-8'); ?></p>
         <p>Engine used: <?php echo htmlspecialchars($result['engine'], ENT_QUOTES, 'UTF-8'); ?></p>
         <p>Engines tried: <?php echo htmlspecialchars(implode(', ', $result['engines_tried']), ENT_QUOTES, 'UTF-8'); ?></p>
+        <p>Numbers/digits excluded: <?php echo $result['exclude_numbers'] ? 'Yes' : 'No'; ?></p>
         <p>Text output: <a href="<?php echo htmlspecialchars($result['text_file'], ENT_QUOTES, 'UTF-8'); ?>"><?php echo htmlspecialchars($result['text_file'], ENT_QUOTES, 'UTF-8'); ?></a></p>
         <p>Meta output: <a href="<?php echo htmlspecialchars($result['meta_file'], ENT_QUOTES, 'UTF-8'); ?>"><?php echo htmlspecialchars($result['meta_file'], ENT_QUOTES, 'UTF-8'); ?></a></p>
 

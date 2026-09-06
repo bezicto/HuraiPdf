@@ -84,14 +84,42 @@ try {
 
     $keywords = $filter->filter($document->getText());
     // "invoice total amount rm payable date ..."
-
 } catch (PdfParseException $e) {
     echo 'Failed to parse PDF: ' . $e->getMessage();
 }
 ```
 
-For an incremental page source, `filterChunks()` preserves input keys and yields
-only non-empty filtered chunks:
+#### Optionally remove numbers and digits
+
+By default, `StopWordFilter::filter()` retains numbers. Pass
+`excludeNumbers: true` to remove ASCII digits (`0`–`9`) from the filtered output:
+
+```php
+$text = 'Invoice 2026 Batch42Code Room7';
+
+$withNumbers = $filter->filter($text);
+// "invoice 2026 batch42code room7"
+
+$withoutNumbers = $filter->filter($text, excludeNumbers: true);
+// "invoice batch code room"
+```
+
+Digits act as token separators. Numeric-only tokens disappear, while the letter
+parts of mixed tokens remain. For example, `Batch42Code` becomes `batch code`.
+This option affects only the filtered result; the `Document` returned by the
+parser continues to contain the original extracted numbers.
+
+The parameter is optional and defaults to `false`, so existing calls require no
+changes:
+
+```php
+$filter->filter($text);                               // Keep numbers
+$filter->filter($text, excludeNumbers: false);       // Keep numbers explicitly
+$filter->filter($text, excludeNumbers: true);        // Remove numbers/digits
+```
+
+For incremental extraction, pass the same option to `filterChunks()`. It
+preserves input keys and omits chunks that become empty after filtering:
 
 ```php
 $filteredPages = $filter->filterChunks(
@@ -99,13 +127,18 @@ $filteredPages = $filter->filterChunks(
         foreach ($parser->parseFilePages('/path/to/document.pdf') as $number => $page) {
             yield $number => $page->getText();
         }
-    })()
+    })(),
+    excludeNumbers: true
 );
 
 foreach ($filteredPages as $pageNumber => $keywords) {
     // Persist or index one filtered page at a time.
 }
 ```
+
+In the included web interface, select **Exclude numbers/digits from the final
+output** before uploading the PDF. The choice is also saved as
+`exclude_numbers` in the generated JSON metadata.
 
 ---
 
@@ -392,10 +425,12 @@ Then open `http://localhost:8080` in your browser.
 - Max execution time: 300 seconds
 - Requested memory limit: 512 MB; on PHP 8.5, a lower server-level `max_memory_limit` takes precedence
 - Browser preview: first **100 KB**; complete text remains available through the output file
+- Optional **Exclude numbers/digits** checkbox removes ASCII digits from filtered output
 
 The web interface consumes pages incrementally, filters and writes each page
 directly to a temporary output, then atomically publishes the completed text and
-metadata files. Failed extractions remove partial output files.
+metadata files. The metadata records the `exclude_numbers` selection. Failed
+extractions remove partial output files.
 
 Output files are written to `output/`:
 - `<filename>.txt` — extracted plain text

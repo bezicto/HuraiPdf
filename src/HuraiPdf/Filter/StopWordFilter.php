@@ -6,6 +6,9 @@ namespace HuraiPdf\Filter;
 
 final class StopWordFilter
 {
+    private const TOKEN_SEPARATOR_PATTERN = '/[^a-zA-Z0-9]+/';
+    private const LETTER_SEPARATOR_PATTERN = '/[^a-zA-Z]+/';
+
     /** @var array<string, true> */
     private static array $baseMap = [];
     private static bool $baseLoaded = false;
@@ -34,15 +37,17 @@ final class StopWordFilter
      * Remove stopwords from the given text and return a space-separated
      * string of remaining tokens, suitable for keyword indexing.
      */
-    public function filter(string $text): string
+    public function filter(string $text, bool $excludeNumbers = false): string
     {
         if ($text === '') {
             return '';
         }
 
-        // Split on anything that is not a plain ASCII letter or digit.
-        // This strips all special characters, punctuation, and symbols from the output.
-        $tokens = preg_split('/[^a-zA-Z0-9]+/', strtolower($text), -1, PREG_SPLIT_NO_EMPTY);
+        // Select the separator once so excluding digits adds no per-token scan.
+        $separatorPattern = $excludeNumbers
+            ? self::LETTER_SEPARATOR_PATTERN
+            : self::TOKEN_SEPARATOR_PATTERN;
+        $tokens = preg_split($separatorPattern, strtolower($text), -1, PREG_SPLIT_NO_EMPTY);
         if ($tokens === false) {
             return $text;
         }
@@ -65,10 +70,10 @@ final class StopWordFilter
      * @param iterable<int|string, string> $chunks
      * @return \Generator<int|string, string>
      */
-    public function filterChunks(iterable $chunks): \Generator
+    public function filterChunks(iterable $chunks, bool $excludeNumbers = false): \Generator
     {
         foreach ($chunks as $key => $chunk) {
-            $filtered = $this->filter($chunk);
+            $filtered = $this->filter($chunk, $excludeNumbers);
             if ($filtered !== '') {
                 yield $key => $filtered;
             }
