@@ -507,6 +507,7 @@ you expect to process.
 │       ├── Exception/
 │       │   └── PdfParseException.php  # Custom exception
 │       └── Filter/
+|           └── stopwords/             # all stop words each in own language files .txt
 │           └── StopWordFilter.php     # Stopword filter
 └── composer.json                      # Library metadata and PSR-4 autoloading
 ```
