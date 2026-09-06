@@ -90,6 +90,23 @@ try {
 }
 ```
 
+For an incremental page source, `filterChunks()` preserves input keys and yields
+only non-empty filtered chunks:
+
+```php
+$filteredPages = $filter->filterChunks(
+    (static function () use ($parser): iterable {
+        foreach ($parser->parseFilePages('/path/to/document.pdf') as $number => $page) {
+            yield $number => $page->getText();
+        }
+    })()
+);
+
+foreach ($filteredPages as $pageNumber => $keywords) {
+    // Persist or index one filtered page at a time.
+}
+```
+
 ---
 
 ## API Reference
@@ -101,6 +118,7 @@ The main entry point. Instantiate with `new Parser()`. An optional `ParserOption
 ```php
 use HuraiPdf\Parser;
 use HuraiPdf\ParserOptions;
+use HuraiPdf\Page;
 
 // Default settings
 $parser = new Parser();
@@ -110,8 +128,16 @@ $parser = new Parser(new ParserOptions(
     streamingThreshold: 10 * 1024 * 1024, // use streaming mode above 10 MB (default: 5 MB)
     maxCMapSize:        2_097_152,          // max bytes to decode a CMap (default: 1 MB)
     objectChunkSize:    524_288,            // object scan chunk size (default: 256 KB)
+    maxObjects:         250_000,
+    maxPages:           20_000,
+    maxDecodedBytesTotal: 256 * 1024 * 1024,
+    deadlineSeconds:    120.0,
 ));
 ```
+
+Resource options default to 500,000 objects, 100,000 emitted pages, 100 MB per
+stream, 512 MB cumulative decoded data, 10 million content operators, recursion
+depth 64, and 1,000 retained warnings. `deadlineSeconds` is disabled by default.
 
 #### `parseFile(string $filePath, int $fromPage = 1, ?int $toPage = null): Document`
 
@@ -164,6 +190,53 @@ $document = $parser->parseContent($pdfContent, 1, 3);
 
 Throws the same `PdfParseException` cases as `parseFile()`, including `INVALID_PAGE_RANGE` when `$fromPage < 1` or `$toPage < $fromPage`.
 
+#### Incremental extraction
+
+`parseFilePages()` yields each page as soon as it is extracted. For large files,
+this avoids retaining all extracted page text in a `Document`:
+
+```php
+foreach ($parser->parseFilePages('large.pdf', 10, 20) as $pageNumber => $page) {
+    file_put_contents('pages.txt', $page->getText() . "\n", FILE_APPEND);
+}
+```
+
+`extractFile()` provides a callback-oriented equivalent and returns final metadata
+and metrics:
+
+```php
+$result = $parser->extractFile(
+    'large.pdf',
+    static function (Page $page): void {
+        // Write, index, or transmit this page before the next page is parsed.
+    }
+);
+```
+
+#### Performance metrics
+
+After a parse, `getLastMetrics()` returns counters for the most recent operation:
+
+```php
+$document = $parser->parseFile('report.pdf', 10, 20);
+$metrics = $parser->getLastMetrics();
+
+echo $metrics['objects_loaded'];
+echo $metrics['objects_indexed'];
+echo $metrics['object_bytes_read'];
+echo $metrics['decoded_bytes'];
+echo $metrics['duration_ms'];
+```
+
+`getLastMetadata()` returns `pdf_version`, `is_encrypted`, `warnings`, and the
+number of pages actually emitted. Metadata and metrics are finalized even when a
+page generator is closed early.
+
+For large files with a usable cross-reference table or stream, HuraiPdf loads the
+catalog, requested page-tree segment, and reachable page dependencies lazily.
+Malformed or unsupported cross-reference structures fall back to the compatible
+full-file parser.
+
 ---
 
 ### `Document`
@@ -173,7 +246,7 @@ Returned by both parser methods. Holds all extracted data.
 | Method | Return type | Description |
 |---|---|---|
 | `getText(?int $pageLimit = null)` | `string` | Concatenated text from all pages. Pass an integer to limit how many pages are included. |
-| `getTextGenerator(?int $pageLimit = null)` | `Generator<int, string>` | Yields one page's trimmed text at a time. Useful for streaming large documents without building a single large string. |
+| `getTextGenerator(?int $pageLimit = null)` | `Generator<int, string>` | Yields retained page text without building a combined string. Use `Parser::parseFilePages()` for incremental parsing. |
 | `getPages()` | `Page[]` | Array of all `Page` objects |
 | `getPageCount()` | `int` | Total number of pages extracted |
 | `getPdfVersion()` | `string` | PDF version string (e.g. `"1.4"`, `"1.7"`, or `"unknown"`) |
@@ -255,6 +328,7 @@ Thrown when the parser encounters a fatal error. Extends `\RuntimeException`.
 | `NO_OBJECTS_FOUND` | `4` | No indirect PDF objects located |
 | `NO_PAGES_FOUND` | `5` | No page objects resolved in the document |
 | `INVALID_PAGE_RANGE` | `6` | `$fromPage < 1` or `$toPage < $fromPage` |
+| `RESOURCE_LIMIT_EXCEEDED` | `7` | A configured object, page, stream, decoded-byte, operator, recursion, or deadline limit was exceeded |
 
 ```php
 use HuraiPdf\Exception\PdfParseException;
@@ -317,6 +391,11 @@ Then open `http://localhost:8080` in your browser.
 - Accepted type: `application/pdf` only (validated by MIME type, magic bytes, and extension)
 - Max execution time: 300 seconds
 - Requested memory limit: 512 MB; on PHP 8.5, a lower server-level `max_memory_limit` takes precedence
+- Browser preview: first **100 KB**; complete text remains available through the output file
+
+The web interface consumes pages incrementally, filters and writes each page
+directly to a temporary output, then atomically publishes the completed text and
+metadata files. Failed extractions remove partial output files.
 
 Output files are written to `output/`:
 - `<filename>.txt` — extracted plain text
@@ -336,6 +415,25 @@ ini_set('memory_limit', '512M');
 PHP 8.5 administrators can cap application-level memory changes with
 `max_memory_limit`. Ensure that server-level value is large enough for the PDFs
 you expect to process.
+
+## Development
+
+Install development dependencies and run the regression suite:
+
+```bash
+composer install
+composer test
+```
+
+Run the synthetic range/full-document benchmark:
+
+```bash
+composer benchmark
+```
+
+The benchmark reports elapsed time, page count, objects loaded versus indexed,
+object bytes read, decoded bytes, content operators, and peak memory. Production
+decisions should also be checked against a representative corpus of real PDFs.
 
 ---
 
@@ -357,6 +455,7 @@ you expect to process.
 │   └── HuraiPdf/
 │       ├── Parser.php                 # Main parsing engine
 │       ├── ParserOptions.php          # Tunable thresholds passed to Parser
+│       ├── ParseContext.php            # Per-operation caches, counters, and metadata
 │       ├── Document.php               # Parsed document container
 │       ├── Page.php                   # Single page with text
 │       ├── PdfObject.php              # Internal typed value object for PDF indirect objects
