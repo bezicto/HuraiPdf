@@ -50,6 +50,40 @@ spl_autoload_register(static function (string $class): void {
 
 ---
 
+## Minimal Installation
+
+If you downloaded or cloned the entire repository, you can remove files that are not needed to run HuraiPdf.
+
+**Keep these files:**
+
+- `src/` — Keep the entire directory, including `Filter/stopwords/`.
+- `LICENSE.md` — Keep the copyright and license notice.
+- `index.php` — Keep this if you want the included upload-and-extract web interface.
+
+**These items can be removed:**
+
+| File or directory | When it can be removed |
+|---|---|
+| `docs/` | If you do not need the development notes. |
+| `README.md` | Once you no longer need the local documentation. |
+| `.github/` | If you do not need GitHub CI workflows. |
+| `.git/` | If present, and you do not need Git history or updates through Git. |
+| `.gitignore`, `.gitattributes` | If you are no longer managing this copy with Git. |
+| `composer.json` | If you use the manual autoloader shown above or the included `index.php`, instead of Composer. |
+| `index.php` | If you only use HuraiPdf as a library in your own application. |
+| `tests/` | If present, and you do not need to run the local test suite. |
+| `uploads/` | If present, and you no longer need its contents. The current web interface does not use this directory. |
+| `output/` | If present, and you no longer need the saved extraction results. The web interface recreates it when needed, provided PHP can write to the project directory. |
+| `.DS_Store` files | Any time; these are macOS folder metadata. |
+
+For **library-only usage with manual autoloading**, the minimum is `src/` and `LICENSE.md`, together with your application's autoloader.
+
+For **the included web interface**, keep `src/`, `LICENSE.md`, and `index.php`. The `output/` directory is created automatically.
+
+`tests/`, `uploads/`, and `output/` are excluded from Git and are normally absent from a fresh GitHub download.
+
+---
+
 ## Quick Start
 
 ```php
