@@ -73,7 +73,6 @@ If you downloaded or cloned the entire repository, you can remove files that are
 | `index.php` | If you only use HuraiPdf as a library in your own application. |
 | `tests/` | If present, and you do not need to run the local test suite. |
 | `output/` | If present, and you no longer need the saved extraction results. The web interface recreates it when needed, provided PHP can write to the project directory. |
-| `.DS_Store` files | Any time; these are macOS folder metadata. |
 
 For **library-only usage with manual autoloading**, the minimum is `src/` and `LICENSE.md`, together with your application's autoloader.
 
