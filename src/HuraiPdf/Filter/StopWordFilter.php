@@ -58,6 +58,23 @@ final class StopWordFilter
         return implode(' ', $filtered);
     }
 
+    /**
+     * Filter chunks independently so callers can write output incrementally.
+     * Page boundaries are treated as token boundaries.
+     *
+     * @param iterable<int|string, string> $chunks
+     * @return \Generator<int|string, string>
+     */
+    public function filterChunks(iterable $chunks): \Generator
+    {
+        foreach ($chunks as $key => $chunk) {
+            $filtered = $this->filter($chunk);
+            if ($filtered !== '') {
+                yield $key => $filtered;
+            }
+        }
+    }
+
     private function loadFileInto(string $filePath, array &$map): void
     {
         if (!is_file($filePath) || !is_readable($filePath)) {
