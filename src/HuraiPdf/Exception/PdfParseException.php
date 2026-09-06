@@ -14,6 +14,7 @@ final class PdfParseException extends RuntimeException
     public const int NO_OBJECTS_FOUND   = 4;
     public const int NO_PAGES_FOUND     = 5;
     public const int INVALID_PAGE_RANGE = 6;
+    public const int RESOURCE_LIMIT_EXCEEDED = 7;
 
     public static function fileNotReadable(string $filePath): self
     {
@@ -43,5 +44,10 @@ final class PdfParseException extends RuntimeException
     public static function invalidPageRange(string $message): self
     {
         return new self($message, self::INVALID_PAGE_RANGE);
+    }
+
+    public static function resourceLimitExceeded(string $message): self
+    {
+        return new self($message, self::RESOURCE_LIMIT_EXCEEDED);
     }
 }

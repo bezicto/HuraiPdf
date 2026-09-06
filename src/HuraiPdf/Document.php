@@ -69,8 +69,8 @@ final class Document
     }
 
     /**
-     * Yields one page's trimmed text at a time, avoiding a full in-memory string.
-     * Useful for streaming large documents to disk page-by-page.
+     * Yields retained page text without constructing one combined string.
+     * Use Parser::parseFilePages() to avoid retaining every page during parsing.
      *
      * @return \Generator<int, string>
      */
