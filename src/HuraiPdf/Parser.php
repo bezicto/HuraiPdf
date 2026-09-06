@@ -1475,9 +1475,14 @@ final class Parser
                 foreach ($arrayRangeMatches as $arrayRangeMatch) {
                     $startCodeHex = strtoupper($arrayRangeMatch[1]);
                     $endCodeHex = strtoupper($arrayRangeMatch[2]);
-                    $startCode = (int) hexdec($startCodeHex);
-                    $endCode = (int) hexdec($endCodeHex);
-                    if ($startCode < 0 || $endCode < $startCode || ($endCode - $startCode) > 0xFFFF) {
+                    $startCode = $this->parseCMapSourceCode($startCodeHex);
+                    $endCode = $this->parseCMapSourceCode($endCodeHex);
+                    if (
+                        $startCode === null
+                        || $endCode === null
+                        || $endCode < $startCode
+                        || ($endCode - $startCode) > 0xFFFF
+                    ) {
                         continue;
                     }
                     $codeWidth = strlen($startCodeHex);
@@ -1530,22 +1535,28 @@ final class Parser
                 $endCodeHex = strtoupper($rangeMatch[2]);
                 $startValueHex = strtoupper($rangeMatch[3]);
 
-                $startCode = (int) hexdec($startCodeHex);
-                $endCode = (int) hexdec($endCodeHex);
-                $startValue = (int) hexdec($startValueHex);
+                $startCode = $this->parseCMapSourceCode($startCodeHex);
+                $endCode = $this->parseCMapSourceCode($endCodeHex);
 
                 // Reject implausible ranges produced by mismatched surrogate or
                 // binary data that leaked into the block content.
-                if ($startCode < 0 || $endCode < $startCode || ($endCode - $startCode) > 0xFFFF) {
+                if (
+                    $startCode === null
+                    || $endCode === null
+                    || $endCode < $startCode
+                    || ($endCode - $startCode) > 0xFFFF
+                ) {
                     continue;
                 }
 
                 $codeWidth = strlen($startCodeHex);
-                $valueWidth = strlen($startValueHex);
 
-                for ($code = $startCode, $value = $startValue; $code <= $endCode; $code++, $value++) {
+                for ($code = $startCode; $code <= $endCode; $code++) {
                     $sourceKey = strtoupper(str_pad(dechex($code), $codeWidth, '0', STR_PAD_LEFT));
-                    $destHex = strtoupper(str_pad(dechex($value), $valueWidth, '0', STR_PAD_LEFT));
+                    $destHex = $this->incrementHexString($startValueHex, $code - $startCode);
+                    if ($destHex === null) {
+                        continue;
+                    }
                     $text = $this->hexToUtf8($destHex);
                     if ($text === '') {
                         continue;
@@ -1561,6 +1572,56 @@ final class Parser
             'map' => $map,
             'max_code_bytes' => $maxCodeBytes,
         ];
+    }
+
+    /**
+     * PDF character codes are at most four bytes wide. Reject wider values
+     * before hexdec() can return an out-of-range float on PHP 8.5.
+     */
+    private function parseCMapSourceCode(string $hex): ?int
+    {
+        if ($hex === '' || strlen($hex) > 8 || preg_match('/^[0-9A-Fa-f]+$/', $hex) !== 1) {
+            return null;
+        }
+
+        $value = hexdec($hex);
+        if (is_float($value)) {
+            if ($value > PHP_INT_MAX) {
+                return null;
+            }
+
+            return (int) $value;
+        }
+
+        return $value;
+    }
+
+    /**
+     * Increment an arbitrarily wide hexadecimal byte string without converting
+     * the complete value to an integer. ToUnicode destinations can be wider
+     * than the platform integer size.
+     */
+    private function incrementHexString(string $hex, int $increment): ?string
+    {
+        if ($hex === '' || $increment < 0 || preg_match('/^[0-9A-Fa-f]+$/', $hex) !== 1) {
+            return null;
+        }
+
+        $hex = strtoupper($hex);
+        $carry = $increment;
+
+        for ($index = strlen($hex) - 1; $index >= 0 && $carry > 0; $index--) {
+            $sum = hexdec($hex[$index]) + $carry;
+            $hex[$index] = strtoupper(dechex($sum % 16));
+            $carry = intdiv($sum, 16);
+        }
+
+        while ($carry > 0) {
+            $hex = strtoupper(dechex($carry % 16)) . $hex;
+            $carry = intdiv($carry, 16);
+        }
+
+        return $hex;
     }
 
     /**
@@ -3329,7 +3390,9 @@ final class Parser
                             break;
                         }
                     }
-                    $out .= chr(octdec($octal));
+                    // PHP historically constrained values to one byte. Make that
+                    // behavior explicit to avoid PHP 8.5's out-of-range deprecation.
+                    $out .= chr(octdec($octal) & 0xFF);
                     continue;
                 }
 

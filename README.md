@@ -1,6 +1,6 @@
 # HuraiPdf
 
-A zero-dependency, pure-PHP PDF text extraction library. No external packages required — just PHP 8.2+.
+A zero-dependency, pure-PHP PDF text extraction library tested on PHP 8.3, 8.4, and 8.5.
 
 ---
 
@@ -18,15 +18,29 @@ A zero-dependency, pure-PHP PDF text extraction library. No external packages re
 
 ## Requirements
 
-- PHP **8.2** or higher
-- PHP extensions: `zlib` (for Flate-compressed streams)
-- Composer (optional — only needed if you use PSR-4 autoloading)
+- PHP **8.3, 8.4, or 8.5**
+- PHP extensions: `ctype` and `zlib`
+- Recommended: `mbstring` or `iconv` for legacy font encoding conversion
+- Web interface only: `fileinfo`
+- Composer (optional for library use, required for development and tests)
 
 ---
 
 ## Installation
 
-Clone or download the repository and register the autoloader manually:
+Clone the repository and install its development tools:
+
+```bash
+composer install
+```
+
+Applications using the clone can load the Composer autoloader:
+
+```php
+require __DIR__ . '/vendor/autoload.php';
+```
+
+Alternatively, register the autoloader manually without installing any packages:
 
 ```php
 spl_autoload_register(static function (string $class): void {
@@ -274,7 +288,7 @@ try {
 ```php
 use HuraiPdf\Parser;
 
-$parser   = $parser = new Parser();
+$parser   = new Parser();
 $document = $parser->parseFile('invoice.pdf');
 
 // Save extracted text
@@ -315,7 +329,7 @@ Then open `http://localhost:8080` in your browser.
 - Max file size: **60 MB**
 - Accepted type: `application/pdf` only (validated by MIME type, magic bytes, and extension)
 - Max execution time: 300 seconds
-- Memory limit: 512 MB
+- Requested memory limit: 512 MB; on PHP 8.5, a lower server-level `max_memory_limit` takes precedence
 
 Output files are written to `output/`:
 - `<filename>.txt` — extracted plain text
@@ -331,6 +345,25 @@ For large or complex PDFs, increase PHP's limits before calling the parser:
 ini_set('max_execution_time', '300');
 ini_set('memory_limit', '512M');
 ```
+
+PHP 8.5 administrators can cap application-level memory changes with
+`max_memory_limit`. Ensure that server-level value is large enough for the PDFs
+you expect to process.
+
+---
+
+## Development and compatibility tests
+
+Install the development dependencies and run the test suite:
+
+```bash
+composer install
+composer test
+```
+
+The test suite treats PHP warnings and deprecations as failures. GitHub Actions
+runs syntax checks and the full suite on PHP 8.3, 8.4, and 8.5 for every pull
+request and every push to `main`.
 
 ---
 
@@ -348,6 +381,10 @@ ini_set('memory_limit', '512M');
 ```
 .
 ├── index.php                          # Web interface
+├── composer.json                      # Runtime constraints and PSR-4 autoloading
+├── phpunit.xml.dist                   # Test configuration
+├── tests/                             # Automated regression tests
+├── .github/workflows/                 # PHP 8.3–8.5 compatibility CI
 ├── src/
 │   └── HuraiPdf/
 │       ├── Parser.php                 # Main parsing engine
@@ -368,4 +405,3 @@ ini_set('memory_limit', '512M');
 ## License
 
 MIT
-

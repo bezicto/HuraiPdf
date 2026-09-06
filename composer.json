@@ -1,0 +1,35 @@
+{
+    "name": "bezicto/hurai-pdf",
+    "description": "A zero-dependency, pure-PHP PDF text extraction library.",
+    "type": "library",
+    "license": "MIT",
+    "require": {
+        "php": ">=8.3 <8.6",
+        "ext-ctype": "*",
+        "ext-zlib": "*"
+    },
+    "require-dev": {
+        "phpunit/phpunit": "^12.0"
+    },
+    "suggest": {
+        "ext-fileinfo": "Required by the included web upload interface.",
+        "ext-iconv": "Improves legacy PDF font encoding conversion when mbstring is unavailable.",
+        "ext-mbstring": "Recommended for PDF font encoding conversion."
+    },
+    "autoload": {
+        "psr-4": {
+            "HuraiPdf\\": "src/HuraiPdf/"
+        }
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "HuraiPdf\\Tests\\": "tests/"
+        }
+    },
+    "scripts": {
+        "test": "phpunit --display-deprecations --display-warnings"
+    },
+    "config": {
+        "sort-packages": true
+    }
+}

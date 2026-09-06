@@ -32,7 +32,13 @@ spl_autoload_register(
 // ---------------------------------------------------------------------------
 define('MAX_UPLOAD_BYTES', 60 * 1024 * 1024); // 60 MB, the 60 means 60MB
 ini_set('max_execution_time', '300');  // 5 minutes
-ini_set('memory_limit', '512M');
+$memoryLimit = '512M';
+$maxMemoryLimit = ini_get('max_memory_limit');
+$maxMemoryBytes = is_string($maxMemoryLimit) ? huraiPdfIniSizeToBytes($maxMemoryLimit) : null;
+if ($maxMemoryBytes !== null && $maxMemoryBytes < 512 * 1024 * 1024) {
+    $memoryLimit = (string) $maxMemoryBytes;
+}
+ini_set('memory_limit', $memoryLimit);
 
 $errorMessage = '';
 $result = null;
@@ -219,6 +225,34 @@ function buildSavedPdfPath(string $uploadDir, string $originalName): string
     $suffix = gmdate('Ymd_His') . '_' . $randomPart;
 
     return $uploadDir . '/' . $safeBase . '_' . $suffix . '.pdf';
+}
+
+// Convert the simple byte-size format used by PHP INI memory directives.
+// A null result represents an unlimited or unrecognised value.
+function huraiPdfIniSizeToBytes(string $value): ?int
+{
+    $value = trim($value);
+    if ($value === '' || $value === '-1') {
+        return null;
+    }
+
+    if (preg_match('/^(\d+)\s*([KMG])?$/i', $value, $matches) !== 1) {
+        return null;
+    }
+
+    $amount = (int) $matches[1];
+    $multiplier = match (strtoupper($matches[2] ?? '')) {
+        'G' => 1024 * 1024 * 1024,
+        'M' => 1024 * 1024,
+        'K' => 1024,
+        default => 1,
+    };
+
+    if ($amount > intdiv(PHP_INT_MAX, $multiplier)) {
+        return PHP_INT_MAX;
+    }
+
+    return $amount * $multiplier;
 }
 
 ?>
