@@ -25,6 +25,10 @@ final class StandardSecurityHandler extends Subsystem
     {
         $this->session->budget->guardDeadline();
         $this->key = '';
+        // Manual installations may bypass Composer's extension requirements.
+        if (!extension_loaded('openssl')) {
+            return false;
+        }
         $d = $this->session->syntax->dictionaryEntries($dictionary);
         if (($d['Filter'] ?? '') !== '/Standard') { return false; }
         $this->revision = (int) ($d['R'] ?? 0);
