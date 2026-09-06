@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 use HuraiPdf\Filter\StopWordFilter;
 use HuraiPdf\Parser;
+use HuraiPdf\ParserOptions;
 
 $baseDir = __DIR__;
 $outputDir = $baseDir . '/output';
@@ -31,6 +32,7 @@ spl_autoload_register(
 // memory_limit      : peak RAM PHP may use during a single parse operation.
 // ---------------------------------------------------------------------------
 define('MAX_UPLOAD_BYTES', 60 * 1024 * 1024); // 60 MB, the 60 means 60MB
+define('MAX_PREVIEW_BYTES', 100 * 1024); // Keep browser responses bounded.
 ini_set('max_execution_time', '300');  // 5 minutes
 $memoryLimit = '512M';
 $maxMemoryLimit = ini_get('max_memory_limit');
@@ -117,66 +119,116 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                         //       objectChunkSize:    524_288,           // bytes read per chunk in streaming mode
                         //   ));
                         //
-                        // parseFile() opens the PDF, walks the object graph, decodes compressed streams,
-                        // resolves font encoding maps, and returns a Document with one Page per parsed page.
-                        // Files above the streamingThreshold are read object-by-object to limit peak RAM use.
+                        // extractFile() walks the object graph, decodes compressed streams, resolves font
+                        // encoding maps, and invokes a callback as each requested page is extracted.
+                        // Files above the streamingThreshold are read lazily to limit peak RAM use.
                         // PdfParseException is thrown for unrecoverable errors (bad header, no pages, etc.).
-                        // Non-fatal issues are silently collected and available via $document->getWarnings().
-                        $parser   = new Parser();
-                        $document = $parser->parseFile($savedPdfPath, $fromPage, $toPage);
-
-                        // getText() concatenates text from all parsed pages into one string.
-                        // StopWordFilter removes common English and Malay stopwords, leaving keywords only.
-                        // Skip the filter if you want the raw unfiltered text:
-                        //   $text = $document->getText();
-                        // For large documents, stream page-by-page to avoid building one large string:
-                        //   foreach ($document->getTextGenerator() as $pageText) { ... }
-                        $stopWordFilter = new StopWordFilter();
-                        $text = $stopWordFilter->filter($document->getText());
-
+                        // Non-fatal issues and performance counters are returned after extraction.
                         $savedBaseName = pathinfo($savedPdfPath, PATHINFO_FILENAME);
                         $textOutputPath = $outputDir . '/' . $savedBaseName . '.txt';
                         $metaOutputPath = $outputDir . '/' . $savedBaseName . '.json';
+                        $textTemporaryPath = $textOutputPath . '.part';
+                        $metaTemporaryPath = $metaOutputPath . '.part';
+                        $textHandle = fopen($textTemporaryPath, 'wb');
+                        if ($textHandle === false) {
+                            throw new \RuntimeException('Unable to create the output text file.');
+                        }
 
-                        $textWritten = file_put_contents($textOutputPath, $text);
-                        $metaWritten = file_put_contents(
-                            $metaOutputPath,
-                            json_encode(
-                                [
-                                    'source_file' => basename($savedPdfPath),
-                                    'source_original_name' => $originalName,
-                                    'extracted_at_utc' => gmdate(DATE_ATOM),
-                                    'engine' => 'HuraiPdf/Parser',
-                                    'engines_tried' => ['HuraiPdf/Parser'],
-                                    'pdf_version' => $document->getPdfVersion(),
-                                    'page_count' => $document->getPageCount(),
-                                    'from_page'  => $fromPage,
-                                    'to_page'    => $toPage,
-                                    'is_encrypted' => $document->isEncrypted(),
-                                    'warnings' => $document->getWarnings(),
-                                    'text_length' => strlen($text),
-                                ],
-                                JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES
-                            )
-                        );
+                        $parser = new Parser(new ParserOptions(
+                            maxObjects: 200_000,
+                            maxPages: 20_000,
+                            maxStreamBytes: 64 * 1024 * 1024,
+                            maxDecodedBytesTotal: 256 * 1024 * 1024,
+                            maxContentOperators: 5_000_000,
+                            deadlineSeconds: 280.0,
+                        ));
+                        $stopWordFilter = new StopWordFilter();
+                        $textLength = 0;
+                        $preview = '';
+                        $hasWrittenText = false;
 
-                        if ($textWritten === false || $metaWritten === false) {
-                            $errorMessage = 'Extraction succeeded but saving output files failed.';
-                        } else {
-                            $result = [
-                                'source_pdf' => basename($savedPdfPath),
-                                'page_range' => 'page ' . $fromPage . ($toPage !== null ? ' to ' . $toPage : ' to end'),
-                                'text_file' => 'output/' . basename($textOutputPath),
-                                'meta_file' => 'output/' . basename($metaOutputPath),
+                        try {
+                            $extraction = $parser->extractFile(
+                                $savedPdfPath,
+                                static function ($page) use (
+                                    $stopWordFilter,
+                                    $textHandle,
+                                    &$textLength,
+                                    &$preview,
+                                    &$hasWrittenText
+                                ): void {
+                                    $filtered = $stopWordFilter->filter($page->getText());
+                                    if ($filtered === '') {
+                                        return;
+                                    }
+                                    $chunk = ($hasWrittenText ? ' ' : '') . $filtered;
+                                    writeAll($textHandle, $chunk);
+                                    $hasWrittenText = true;
+                                    $textLength += strlen($chunk);
+                                    if (strlen($preview) < MAX_PREVIEW_BYTES) {
+                                        $preview .= substr($chunk, 0, MAX_PREVIEW_BYTES - strlen($preview));
+                                    }
+                                },
+                                $fromPage,
+                                $toPage
+                            );
+                        } finally {
+                            fclose($textHandle);
+                        }
+
+                        $metadata = $extraction['metadata'];
+                        $metrics = $extraction['metrics'];
+                        $metaJson = json_encode(
+                            [
+                                'source_file' => basename($savedPdfPath),
+                                'source_original_name' => $originalName,
+                                'extracted_at_utc' => gmdate(DATE_ATOM),
                                 'engine' => 'HuraiPdf/Parser',
                                 'engines_tried' => ['HuraiPdf/Parser'],
-                                'warnings' => $document->getWarnings(),
-                                'preview' => $text,
-                            ];
+                                'pdf_version' => $metadata['pdf_version'],
+                                'page_count' => $metadata['page_count'],
+                                'from_page' => $fromPage,
+                                'to_page' => $toPage,
+                                'is_encrypted' => $metadata['is_encrypted'],
+                                'warnings' => $metadata['warnings'],
+                                'text_length' => $textLength,
+                                'performance' => $metrics,
+                            ],
+                            JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR
+                        );
+                        writeAllFile($metaTemporaryPath, $metaJson);
 
-                            $successMessage = 'Extraction complete.';
+                        if (!rename($textTemporaryPath, $textOutputPath)) {
+                            throw new \RuntimeException('Unable to publish the output text file.');
                         }
+                        if (!rename($metaTemporaryPath, $metaOutputPath)) {
+                            @unlink($textOutputPath);
+                            throw new \RuntimeException('Unable to publish the output metadata file.');
+                        }
+
+                        $result = [
+                            'source_pdf' => basename($savedPdfPath),
+                            'page_range' => 'page ' . $fromPage . ($toPage !== null ? ' to ' . $toPage : ' to end'),
+                            'text_file' => 'output/' . basename($textOutputPath),
+                            'meta_file' => 'output/' . basename($metaOutputPath),
+                            'engine' => 'HuraiPdf/Parser',
+                            'engines_tried' => ['HuraiPdf/Parser'],
+                            'warnings' => $metadata['warnings'],
+                            'preview' => $preview,
+                            'preview_truncated' => $textLength > strlen($preview),
+                        ];
+
+                        $successMessage = 'Extraction complete.';
                     } catch (Throwable $exception) {
+                        if (isset($textTemporaryPath)) {
+                            @unlink($textTemporaryPath);
+                        }
+                        if (isset($metaTemporaryPath)) {
+                            @unlink($metaTemporaryPath);
+                        }
+                        if (isset($savedPdfPath)) {
+                            @unlink($savedPdfPath);
+                        }
                         // Do not expose internal file paths from FILE_NOT_READABLE exceptions
                         if (
                             $exception instanceof \HuraiPdf\Exception\PdfParseException &&
@@ -255,6 +307,33 @@ function huraiPdfIniSizeToBytes(string $value): ?int
     return $amount * $multiplier;
 }
 
+/** @param resource $handle */
+function writeAll($handle, string $data): void
+{
+    $offset = 0;
+    $length = strlen($data);
+    while ($offset < $length) {
+        $written = fwrite($handle, substr($data, $offset, 8192));
+        if ($written === false || $written === 0) {
+            throw new \RuntimeException('Failed while writing extracted text.');
+        }
+        $offset += $written;
+    }
+}
+
+function writeAllFile(string $path, string $data): void
+{
+    $handle = fopen($path, 'wb');
+    if ($handle === false) {
+        throw new \RuntimeException('Unable to create the output metadata file.');
+    }
+    try {
+        writeAll($handle, $data);
+    } finally {
+        fclose($handle);
+    }
+}
+
 ?>
 <!doctype html>
 <html lang="en">
@@ -302,6 +381,9 @@ function huraiPdfIniSizeToBytes(string $value): ?int
 
         <h3>Extracted Text</h3>
         <pre style="white-space:pre-wrap;word-break:break-word;max-height:80vh;overflow-y:auto;border:1px solid #ccc;padding:1em;"><?php echo htmlspecialchars($result['preview'], ENT_QUOTES, 'UTF-8'); ?></pre>
+        <?php if ($result['preview_truncated']): ?>
+            <p>Preview truncated. Download the text output for the complete extraction.</p>
+        <?php endif; ?>
     <?php endif; ?>
 </body>
 </html>
