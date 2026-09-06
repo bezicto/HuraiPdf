@@ -12,14 +12,36 @@ final class Parser
 
     private ?ParseContext $context = null;
 
+    private bool $active = false;
+
+    /** @var (\Closure(int, bool): bool)|null */
+    private ?\Closure $objectLoader = null;
+
     public function __construct(ParserOptions $options = new ParserOptions())
     {
         $this->options = $options;
     }
 
+    private function beginOperation(): void
+    {
+        if ($this->active) {
+            throw new \LogicException('This parser has an active operation. Close its generator or use another Parser.');
+        }
+        $this->context = new ParseContext();
+        $this->active = true;
+    }
+
+    private function assertInputBudget(int $bytes): void
+    {
+        if ($bytes > $this->options->maxInputBytes) {
+            throw PdfParseException::resourceLimitExceeded('PDF input exceeds maxInputBytes.');
+        }
+        $this->guardDeadline();
+    }
+
     public function parseFile(string $filePath, int $fromPage = 1, ?int $toPage = null): Document
     {
-        $this->context = new ParseContext();
+        $this->beginOperation();
 
         try {
             $this->validatePageRange($fromPage, $toPage);
@@ -29,6 +51,7 @@ final class Parser
             }
 
             $fileSize = filesize($filePath);
+            $this->assertInputBudget($fileSize === false ? 0 : $fileSize);
             if ($fileSize !== false && $fileSize > $this->options->streamingThreshold) {
                 $this->context->metrics['streaming_path'] = true;
                 return $this->parseFileStreaming($filePath, $fromPage, $toPage);
@@ -42,6 +65,8 @@ final class Parser
             return $this->parseContentInternal($content, $fromPage, $toPage);
         } finally {
             $this->context->finish();
+            $this->active = false;
+            $this->objectLoader = null;
         }
     }
 
@@ -77,7 +102,7 @@ final class Parser
      */
     public function parseFilePages(string $filePath, int $fromPage = 1, ?int $toPage = null): \Generator
     {
-        $this->context = new ParseContext();
+        $this->beginOperation();
 
         try {
             $this->validatePageRange($fromPage, $toPage);
@@ -86,22 +111,13 @@ final class Parser
             }
 
             $fileSize = filesize($filePath);
-            if ($fileSize !== false && $fileSize > $this->options->streamingThreshold) {
-                $this->context->metrics['streaming_path'] = true;
-                yield from $this->streamFilePagesInternal($filePath, $fromPage, $toPage);
-                return;
-            }
-
-            $content = file_get_contents($filePath);
-            if ($content === false) {
-                throw PdfParseException::fileReadFailure();
-            }
-            $document = $this->parseContentInternal($content, $fromPage, $toPage);
-            foreach ($document->getPages() as $page) {
-                yield $page->getPageNumber() => $page;
-            }
+            $this->assertInputBudget($fileSize === false ? 0 : $fileSize);
+            $this->context->metrics['streaming_path'] = true;
+            yield from $this->streamFilePagesInternal($filePath, $fromPage, $toPage);
         } finally {
             $this->context->finish();
+            $this->active = false;
+            $this->objectLoader = null;
         }
     }
 
@@ -156,8 +172,23 @@ final class Parser
         }
 
         try {
+            yield from $this->streamHandlePagesInternal($handle, $fromPage, $toPage);
+        } finally {
+            fclose($handle);
+        }
+    }
+
+    /** @param resource $handle @return \Generator<int, Page> */
+    private function streamHandlePagesInternal($handle, int $fromPage, ?int $toPage): \Generator
+    {
+        try {
             $stat = fstat($handle);
             $fileSize = $stat !== false ? (int) $stat['size'] : 0;
+            $this->assertInputBudget($fileSize);
+            $header = $this->readFileRange($handle, 0, min(16, $fileSize));
+            if (!str_starts_with($header, '%PDF-')) {
+                throw PdfParseException::invalidHeader();
+            }
             $warnings = [];
             $index = $this->readFileXRefIndex($handle, $fileSize, $warnings);
             if ($index === null || $index['root_id'] === null) {
@@ -169,25 +200,25 @@ final class Parser
             }
 
             $objects = [];
+            $this->objectLoader = function (int $id, bool $formOnly = false) use (&$objects, $index, $handle, &$warnings): bool {
+                if ($formOnly && !isset($objects[$id]) && isset($index['offsets'][$id])) {
+                    $entry = $index['offsets'][$id];
+                    $prefix = $this->readFileRange($handle, $entry['offset'], min(4096, $entry['next'] - $entry['offset']));
+                    $this->context->metrics['object_bytes_read'] += strlen($prefix);
+                    if (preg_match('/\/Subtype\s*\/Image\b/', $prefix) === 1) { return false; }
+                }
+                return $this->loadObjectFromIndex($id, $objects, $index, $handle, $warnings);
+            };
             $pageObjectIds = [];
             $ordinal = 0;
             $pagesFound = 0;
 
             if (!$this->loadObjectFromIndex($index['root_id'], $objects, $index, $handle, $warnings)) {
-                $document = $this->parseWholeFileFallback($handle, $fromPage, $toPage);
-                foreach ($document->getPages() as $page) {
-                    yield $page->getPageNumber() => $page;
-                }
-                return;
+                throw PdfParseException::noObjectsFound();
             }
-
             $catalogBody = $objects[$index['root_id']]->body;
             if (preg_match('/\/Pages\s+(\d+)\s+\d+\s+R/', $catalogBody, $rootPagesMatch) !== 1) {
-                $document = $this->parseWholeFileFallback($handle, $fromPage, $toPage);
-                foreach ($document->getPages() as $page) {
-                    yield $page->getPageNumber() => $page;
-                }
-                return;
+                throw PdfParseException::noPagesFound();
             }
 
             $this->walkPageTreeFromIndex(
@@ -204,11 +235,7 @@ final class Parser
             );
 
             if ($pagesFound === 0) {
-                $document = $this->parseWholeFileFallback($handle, $fromPage, $toPage);
-                foreach ($document->getPages() as $page) {
-                    yield $page->getPageNumber() => $page;
-                }
-                return;
+                throw PdfParseException::noPagesFound();
             }
 
             fseek($handle, 0);
@@ -224,11 +251,13 @@ final class Parser
 
             $pageCount = 0;
             foreach ($pageObjectIds as $pageIndex => $pageObjectId) {
-                $this->loadObjectDependencyClosure([$pageObjectId], $objects, $index, $handle, $warnings);
-                $this->loadInheritedResourceDependencies($pageObjectId, $objects, $index, $handle, $warnings);
                 $text = $this->extractPageText($pageObjectId, $objects, $warnings);
                 $page = new Page($fromPage + $pageIndex, $pageObjectId, $this->normalizeText($text));
                 $pageCount++;
+                if ($pageCount === 1) {
+                    $this->context->metrics['first_page_ms'] = (hrtime(true) - $this->context->startedAtNanoseconds) / 1_000_000;
+                }
+                $this->releasePageObjects($objects, $pageObjectId);
                 $this->recordParseMetadata($pdfVersion, $encrypted, $warnings, $pageCount);
                 yield $page->getPageNumber() => $page;
             }
@@ -236,7 +265,6 @@ final class Parser
             if (isset($pdfVersion, $encrypted, $warnings, $pageCount)) {
                 $this->recordParseMetadata($pdfVersion, $encrypted, $warnings, $pageCount);
             }
-            fclose($handle);
         }
     }
 
@@ -244,12 +272,13 @@ final class Parser
     private function parseWholeFileFallback($handle, int $fromPage, ?int $toPage): Document
     {
         fseek($handle, 0);
-        $content = stream_get_contents($handle);
+        $content = stream_get_contents($handle, $this->options->maxInputBytes + 1);
+        $this->assertInputBudget($content === false ? 0 : strlen($content));
         if ($content === false) {
             throw PdfParseException::fileReadFailure();
         }
         $this->context->metrics['streaming_path'] = false;
-        return $this->parseContentInternal($content, $fromPage, $toPage);
+        return $this->parseRecoveredContentInternal($content, $fromPage, $toPage);
     }
 
     /**
@@ -279,6 +308,7 @@ final class Parser
         $visited = [];
         $offsetEntries = [];
         $compressedEntries = [];
+        $seenIds = [];
         $rootId = null;
         $encrypted = false;
         $sectionBoundaries = [];
@@ -307,18 +337,38 @@ final class Parser
             }
 
             $this->context->metrics['xref_sections']++;
+            // Hybrid xref streams override placeholder free entries in their table.
+            if ($section['xref_stream_offset'] !== null) {
+                $hybrid = $this->readXRefStreamSection($handle, $section['xref_stream_offset'], $fileSize, $warnings);
+                if ($hybrid === null) {
+                    return null;
+                }
+                $sectionBoundaries[] = $section['xref_stream_offset'];
+                $section['offsets'] = $hybrid['offsets'] + $section['offsets'];
+                $section['compressed'] = $hybrid['compressed'] + $section['compressed'];
+                $section['free'] = array_diff_key($section['free'], $hybrid['offsets'], $hybrid['compressed']) + $hybrid['free'];
+                $section['xref_stream_offset'] = null;
+                $this->context->metrics['xref_sections']++;
+            }
             foreach ($section['offsets'] as $objectId => $entry) {
-                $allObjectBoundaries[] = $entry['offset'];
-                if (!isset($offsetEntries[$objectId]) && !isset($compressedEntries[$objectId])) {
+                $allObjectBoundaries[$entry['offset']] = $entry['offset'];
+                if (!isset($seenIds[$objectId])) {
                     $offsetEntries[$objectId] = $entry;
-                    $this->assertObjectBudget(count($offsetEntries) + count($compressedEntries));
+                    $seenIds[$objectId] = true;
                 }
             }
             foreach ($section['compressed'] as $objectId => $entry) {
-                if (!isset($offsetEntries[$objectId]) && !isset($compressedEntries[$objectId])) {
+                if (!isset($seenIds[$objectId])) {
                     $compressedEntries[$objectId] = $entry;
-                    $this->assertObjectBudget(count($offsetEntries) + count($compressedEntries));
+                    $seenIds[$objectId] = true;
                 }
+            }
+            foreach ($section['free'] as $objectId => $_) {
+                $seenIds[$objectId] = true;
+            }
+            $this->assertObjectBudget(count($seenIds) - (isset($seenIds[0]) ? 1 : 0));
+            if (count($visited) > $this->options->maxObjects || count($allObjectBoundaries) > $this->options->maxObjects) {
+                throw PdfParseException::resourceLimitExceeded('Cross-reference history exceeds maxObjects.');
             }
 
             $rootId ??= $section['root_id'];
@@ -369,17 +419,46 @@ final class Parser
      * @param resource $handle
      * @return array{offsets:array<int,array{offset:int,generation:int}>,compressed:array<int,array{stream_id:int,index:int}>,root_id:?int,encrypted:bool,prev:?int,xref_stream_offset:?int}|null
      */
+    private function readPdfLine($handle, string &$buffer): string|false
+    {
+        while (true) {
+            $end = strcspn($buffer, "\r\n");
+            if ($end < strlen($buffer)) {
+                if ($buffer[$end] === "\r" && $end + 1 === strlen($buffer) && !feof($handle)) {
+                    $part = fread($handle, 4096);
+                    if ($part !== false) { $buffer .= $part; }
+                }
+                $length = $end + (($buffer[$end] === "\r" && ($buffer[$end + 1] ?? '') === "\n") ? 2 : 1);
+                $line = substr($buffer, 0, $length);
+                $buffer = substr($buffer, $length);
+                return $line;
+            }
+            if (strlen($buffer) >= 65536) { return false; }
+            $this->guardDeadline();
+            $part = fread($handle, 4096);
+            if ($part === false || $part === '') {
+                $line = $buffer;
+                $buffer = '';
+                return $line === '' ? false : $line;
+            }
+            $buffer .= $part;
+        }
+    }
+
     private function readTraditionalXRefSection($handle, int $offset, int $fileSize): ?array
     {
         fseek($handle, $offset);
-        $firstLine = fgets($handle);
+        $lineBuffer = "";
+        $firstLine = $this->readPdfLine($handle, $lineBuffer);
         if ($firstLine === false || trim($firstLine) !== 'xref') {
             return null;
         }
 
         $entries = [];
+        $free = [];
         $trailerText = '';
-        while (($line = fgets($handle)) !== false) {
+        while (($line = $this->readPdfLine($handle, $lineBuffer)) !== false) {
+            $this->guardDeadline();
             $trimmed = trim($line);
             if ($trimmed === '') {
                 continue;
@@ -389,7 +468,7 @@ final class Parser
                 while (
                     $this->extractFirstDictionary($trailerText) === null &&
                     strlen($trailerText) < 1_048_576 &&
-                    ($nextLine = fgets($handle)) !== false
+                    ($nextLine = $this->readPdfLine($handle, $lineBuffer)) !== false
                 ) {
                     $trailerText .= "\n" . $nextLine;
                 }
@@ -401,8 +480,10 @@ final class Parser
             }
             $startId = (int) $subsection[1];
             $count = (int) $subsection[2];
+            $this->assertObjectBudget(count($entries) + count($free) + max(0, $count - ($startId === 0 ? 1 : 0)));
             for ($i = 0; $i < $count; $i++) {
-                $entryLine = fgets($handle);
+                if (($i & 255) === 0) { $this->guardDeadline(); }
+                $entryLine = $this->readPdfLine($handle, $lineBuffer);
                 if ($entryLine === false) {
                     return null;
                 }
@@ -410,6 +491,7 @@ final class Parser
                     return null;
                 }
                 if ($entryMatch[3] !== 'n') {
+                    $free[$startId + $i] = true;
                     continue;
                 }
                 $objectOffset = (int) $entryMatch[1];
@@ -425,6 +507,7 @@ final class Parser
 
         $dictionary = $this->extractFirstDictionary($trailerText) ?? '';
         return [
+            'free' => $free,
             'offsets' => $entries,
             'compressed' => [],
             'root_id' => $this->extractReferenceId($dictionary, 'Root'),
@@ -451,7 +534,7 @@ final class Parser
             return null;
         }
         $body = substr($rawObject, $bodyStart, $endOffset - $bodyStart);
-        $streamInfo = $this->extractStreamInfoFromObjectBody($body, []);
+        $streamInfo = $this->extractStreamInfoFromObjectBody($body);
         if ($streamInfo === null) {
             return null;
         }
@@ -465,7 +548,7 @@ final class Parser
             return null;
         }
         $widths = array_map('intval', preg_split('/\s+/', trim($widthMatch[1])) ?: []);
-        if (count($widths) < 3) {
+        if (count($widths) !== 3 || max($widths) > 8) {
             return null;
         }
         [$w0, $w1, $w2] = $widths;
@@ -487,12 +570,15 @@ final class Parser
 
         $offsetEntries = [];
         $compressedEntries = [];
+        $free = [];
         $dataOffset = 0;
         $dataLength = strlen($decoded);
         foreach ($ranges as [$startId, $rangeCount]) {
+            $this->assertObjectBudget(count($offsetEntries) + count($compressedEntries) + count($free) + max(0, $rangeCount - ($startId === 0 ? 1 : 0)));
             for ($i = 0; $i < $rangeCount; $i++) {
+                if (($i & 255) === 0) { $this->guardDeadline(); }
                 if ($dataOffset + $entrySize > $dataLength) {
-                    break 2;
+                    return null;
                 }
                 $type = $this->readBigEndianField($decoded, $dataOffset, $w0);
                 if ($w0 === 0) {
@@ -501,7 +587,9 @@ final class Parser
                 $field1 = $this->readBigEndianField($decoded, $dataOffset, $w1);
                 $field2 = $this->readBigEndianField($decoded, $dataOffset, $w2);
                 $objectId = $startId + $i;
-                if ($type === 1 && $field1 > 0 && $field1 < $fileSize) {
+                if ($type === 0) {
+                    $free[$objectId] = true;
+                } elseif ($type === 1 && $field1 > 0 && $field1 < $fileSize) {
                     $offsetEntries[$objectId] = ['offset' => $field1, 'generation' => $field2];
                 } elseif ($type === 2 && $field1 > 0) {
                     $compressedEntries[$objectId] = ['stream_id' => $field1, 'index' => $field2];
@@ -511,6 +599,7 @@ final class Parser
         }
 
         return [
+            'free' => $free,
             'offsets' => $offsetEntries,
             'compressed' => $compressedEntries,
             'root_id' => $this->extractReferenceId($dictionary, 'Root'),
@@ -551,7 +640,8 @@ final class Parser
         }
         $result = '';
         while (strlen($result) < $length) {
-            $part = fread($handle, $length - strlen($result));
+            $this->guardDeadline();
+            $part = fread($handle, min($this->options->objectChunkSize, $length - strlen($result)));
             if ($part === false || $part === '') {
                 break;
             }
@@ -568,8 +658,9 @@ final class Parser
         }
         $chunk = '';
         $chunkSize = max(4096, $this->options->objectChunkSize);
-        $maximum = min(50 * 1024 * 1024, $fileSize - $offset);
+        $maximum = min($this->options->maxObjectBytes, $fileSize - $offset);
         while (strlen($chunk) < $maximum) {
+            $this->guardDeadline();
             $part = fread($handle, min($chunkSize, $maximum - strlen($chunk)));
             if ($part === false || $part === '') {
                 break;
@@ -606,6 +697,9 @@ final class Parser
                 }
             }
         }
+        if (strlen($chunk) >= $this->options->maxObjectBytes) {
+            throw PdfParseException::resourceLimitExceeded('PDF object exceeds maxObjectBytes.');
+        }
         return $chunk === '' ? null : $chunk;
     }
 
@@ -637,7 +731,8 @@ final class Parser
             if (!$this->loadObjectFromIndex($streamId, $objects, $index, $handle, $warnings, $depth + 1)) {
                 return false;
             }
-            $this->expandObjectStreams($objects, $warnings);
+            unset($this->context->expandedObjectStreams[$streamId]);
+            $this->expandObjectStreams($objects, $warnings, $index);
             return isset($objects[$objectId]);
         }
 
@@ -646,16 +741,25 @@ final class Parser
         }
         $entry = $index['offsets'][$objectId];
         $length = $entry['next'] - $entry['offset'];
-        if ($length <= 0 || $length > 50 * 1024 * 1024) {
-            return false;
+        if ($length <= 0) { return false; }
+        if ($length > $this->options->maxObjectBytes) {
+            throw PdfParseException::resourceLimitExceeded('PDF object exceeds maxObjectBytes.');
         }
         $raw = $this->readFileRange($handle, $entry['offset'], $length);
         $this->context->metrics['object_bytes_read'] += strlen($raw);
         if (preg_match('/^\s*(\d+)\s+(\d+)\s+obj\b/', $raw, $header) !== 1) {
             return false;
         }
+        if ((int) $header[1] !== $objectId || (int) $header[2] !== $entry['generation']) {
+            $this->addWarning($warnings, 'Cross-reference object identity mismatch for object ' . $objectId . '.');
+            return false;
+        }
         $bodyStart = strlen($header[0]);
-        $endOffset = $this->locateEndObjOffset($raw, $bodyStart);
+        $dictionary = $this->extractFirstDictionary(substr($raw, $bodyStart)) ?? '';
+        if (preg_match('/\/Length\s+(\d+)\s+\d+\s+R\b/', $dictionary, $lengthRef) === 1) {
+            $this->loadObjectFromIndex((int) $lengthRef[1], $objects, $index, $handle, $warnings, $depth + 1);
+        }
+        $endOffset = $this->locateEndObjOffset($raw, $bodyStart, $objects);
         if ($endOffset === null) {
             return false;
         }
@@ -754,93 +858,40 @@ final class Parser
         }
     }
 
-    /**
-     * @param int[] $rootIds
-     * @param array<int, PdfObject> $objects
-     * @param array{offsets:array<int,array{offset:int,generation:int,next:int}>,compressed:array<int,array{stream_id:int,index:int}>,root_id:?int,encrypted:bool} $index
-     * @param resource $handle
-     * @param string[] $warnings
-     */
-    private function loadObjectDependencyClosure(array $rootIds, array &$objects, array $index, $handle, array &$warnings): void
-    {
-        $queue = $rootIds;
-        $seen = [];
-        while ($queue !== []) {
-            $this->guardDeadline();
-            $objectId = array_pop($queue);
-            if (isset($seen[$objectId])) {
-                continue;
-            }
-            $seen[$objectId] = true;
-            if (!$this->loadObjectFromIndex($objectId, $objects, $index, $handle, $warnings)) {
-                continue;
-            }
-            $body = $objects[$objectId]->body;
-            $streamPosition = strpos($body, 'stream');
-            $referenceText = $streamPosition === false ? $body : substr($body, 0, $streamPosition);
-            if (preg_match('/\/Type\s*\/Page\b/', $referenceText) === 1) {
-                $referenceText = preg_replace('/\/Parent\s+\d+\s+\d+\s+R/', '', $referenceText) ?? $referenceText;
-            }
-            if (preg_match('/\/Type\s*\/Pages\b/', $referenceText) === 1) {
-                $referenceText = preg_replace('/\/Kids\s*\[.*?\]/s', '', $referenceText) ?? $referenceText;
-                $referenceText = preg_replace('/\/Parent\s+\d+\s+\d+\s+R/', '', $referenceText) ?? $referenceText;
-            }
-            preg_match_all('/(\d+)\s+\d+\s+R/', $referenceText, $references);
-            foreach ($references[1] as $referenceId) {
-                $queue[] = (int) $referenceId;
-            }
-        }
-    }
-
-    /**
-     * @param array<int, PdfObject> $objects
-     * @param array{offsets:array<int,array{offset:int,generation:int,next:int}>,compressed:array<int,array{stream_id:int,index:int}>,root_id:?int,encrypted:bool} $index
-     * @param resource $handle
-     * @param string[] $warnings
-     */
-    private function loadInheritedResourceDependencies(int $pageId, array &$objects, array $index, $handle, array &$warnings): void
-    {
-        $currentId = $pageId;
-        $seen = [];
-        while (!isset($seen[$currentId])) {
-            $this->guardDeadline();
-            $seen[$currentId] = true;
-            if (!$this->loadObjectFromIndex($currentId, $objects, $index, $handle, $warnings)) {
-                break;
-            }
-            $body = $objects[$currentId]->body;
-            if (preg_match('/\/Resources\s+(\d+)\s+\d+\s+R/', $body, $resourceMatch) === 1) {
-                $this->loadObjectDependencyClosure([(int) $resourceMatch[1]], $objects, $index, $handle, $warnings);
-                break;
-            }
-            $inlineResources = $this->extractInlineDictionaryForKey($body, 'Resources');
-            if ($inlineResources !== '') {
-                preg_match_all('/(\d+)\s+\d+\s+R/', $inlineResources, $references);
-                $this->loadObjectDependencyClosure(array_map('intval', $references[1]), $objects, $index, $handle, $warnings);
-                break;
-            }
-            if (preg_match('/\/Parent\s+(\d+)\s+\d+\s+R/', $body, $parentMatch) !== 1) {
-                break;
-            }
-            $currentId = (int) $parentMatch[1];
-        }
-    }
-
-
-
     public function parseContent(string $content, int $fromPage = 1, ?int $toPage = null): Document
     {
-        $this->context = new ParseContext();
+        $this->beginOperation();
 
         try {
             $this->validatePageRange($fromPage, $toPage);
             return $this->parseContentInternal($content, $fromPage, $toPage);
         } finally {
             $this->context->finish();
+            $this->active = false;
+            $this->objectLoader = null;
         }
     }
 
     private function parseContentInternal(string $content, int $fromPage, ?int $toPage): Document
+    {
+        $this->assertInputBudget(strlen($content));
+        $handle = fopen('php://memory', 'w+b');
+        if ($handle === false) {
+            throw PdfParseException::fileReadFailure();
+        }
+        try {
+            if (fwrite($handle, $content) !== strlen($content)) {
+                throw PdfParseException::fileReadFailure();
+            }
+            $pages = iterator_to_array($this->streamHandlePagesInternal($handle, $fromPage, $toPage), false);
+            $metadata = $this->getLastMetadata();
+            return new Document($pages, $metadata['pdf_version'], $metadata['is_encrypted'], $metadata['warnings']);
+        } finally {
+            fclose($handle);
+        }
+    }
+
+    private function parseRecoveredContentInternal(string $content, int $fromPage, ?int $toPage): Document
     {
         $this->validatePageRange($fromPage, $toPage);
 
@@ -849,6 +900,8 @@ final class Parser
         }
 
         $warnings = [];
+        $this->addWarning($warnings, 'Cross-reference index unavailable; using bounded full-file recovery.');
+        $this->context->metrics['recovery_path'] = true;
         $pdfVersion = $this->extractPdfVersion($content);
         $objects = $this->collectIndirectObjects($content);
         $this->assertObjectBudget(count($objects));
@@ -864,7 +917,7 @@ final class Parser
 
         $this->expandObjectStreams($objects, $warnings);
 
-        $resolutionLimit = $toPage ?? min(PHP_INT_MAX, $fromPage + $this->options->maxPages);
+        $resolutionLimit = $toPage ?? ($fromPage > PHP_INT_MAX - $this->options->maxPages ? PHP_INT_MAX : $fromPage + $this->options->maxPages);
         $pageObjectIds = $this->resolvePageObjectIds($objects, $resolutionLimit);
         if ($pageObjectIds === []) {
             throw PdfParseException::noPagesFound();
@@ -916,6 +969,111 @@ final class Parser
             throw PdfParseException::resourceLimitExceeded('Requested page range exceeds maxPages.');
         }
 
+    }
+
+    private function ensureObject(int $id, array &$objects, bool $formOnly = false): bool
+    {
+        return isset($objects[$id]) || ($this->objectLoader !== null && ($this->objectLoader)($id, $formOnly));
+    }
+
+    private function releasePageObjects(array &$objects, int $pageId): void
+    {
+        unset($objects[$pageId], $this->context->resourceBodiesCache[$pageId]);
+        $bytes = 0;
+        foreach ($objects as $id => $object) {
+            if (str_contains($object->body, 'stream')) {
+                unset($objects[$id], $this->context->expandedObjectStreams[$id]);
+                continue;
+            }
+            $bytes += strlen($object->body) + 256;
+        }
+        $bytes += $this->context->cmapAllocationBytes;
+        foreach (['decodedStreamCache', 'formTextCache', 'resourceBodiesCache', 'resourceFontMapsCache', 'resourceXObjectMapsCache'] as $cache) {
+            foreach ($this->context->$cache as $value) {
+                $bytes += $this->estimateCacheBytes($value);
+            }
+        }
+        if ($bytes > $this->options->maxCacheBytes) {
+            $objects = [];
+            foreach (['fontMapCache', 'decodedStreamCache', 'resourceBodiesCache', 'expandedObjectStreams', 'formTextCache', 'resourceFontMapsCache', 'resourceXObjectMapsCache'] as $cache) {
+                $this->context->$cache = [];
+            }
+            $this->context->cmapAllocationBytes = 0;
+            $this->context->metrics['cache_evictions']++;
+            $bytes = 0;
+        }
+        $this->context->metrics['cache_bytes'] = $bytes;
+    }
+
+    private function cacheStringResult(string $cache, int $id, string $value): void
+    {
+        if (strlen($value) + 128 > $this->options->maxCacheBytes) { return; }
+        $bytes = $this->context->cmapAllocationBytes + strlen($value) + 128;
+        foreach (['decodedStreamCache', 'formTextCache'] as $name) {
+            foreach ($this->context->$name as $key => $entry) {
+                if ($name !== $cache || $key !== $id) { $bytes += strlen($entry) + 128; }
+            }
+        }
+        if ($bytes > $this->options->maxCacheBytes) {
+            $this->context->decodedStreamCache = [];
+            $this->context->formTextCache = [];
+            $this->context->metrics['cache_evictions']++;
+        }
+        if ($this->context->cmapAllocationBytes + strlen($value) + 128 <= $this->options->maxCacheBytes) {
+            $this->context->{$cache}[$id] = $value;
+        }
+    }
+
+    private function estimateCacheBytes(mixed $value): int
+    {
+        if (is_string($value)) { return strlen($value) + 64; }
+        if (!is_array($value)) { return 32; }
+        $bytes = 128;
+        foreach ($value as $key => $child) {
+            // Font maps are already charged once in cmapAllocationBytes.
+            $bytes += 64 + (is_string($key) ? strlen($key) : 0);
+            if ($key !== 'map') { $bytes += $this->estimateCacheBytes($child); }
+        }
+        return $bytes;
+    }
+
+    private function appendBoundedText(string &$out, string $text): void
+    {
+        if (strlen($text) > $this->options->maxExtractedTextBytes - strlen($out)) {
+            throw PdfParseException::resourceLimitExceeded('Extracted text exceeds maxExtractedTextBytes.');
+        }
+        $out .= $text;
+    }
+
+    private function appendTextPart(array &$parts, string $text): void
+    {
+        $total = $this->context->metrics['generated_text_bytes'] + strlen($text);
+        if ($total > $this->options->maxExtractedTextBytes) {
+            throw PdfParseException::resourceLimitExceeded('Generated text exceeds maxExtractedTextBytes.');
+        }
+        $this->context->metrics['generated_text_bytes'] = $total;
+        $parts[] = $text;
+    }
+
+    private function accountCMapEntry(int $bytes): void
+    {
+        $this->guardDeadline();
+        if (++$this->context->metrics['cmap_entries'] > $this->options->maxCMapEntries) {
+            throw PdfParseException::resourceLimitExceeded('CMap expansion exceeds maxCMapEntries.');
+        }
+        $this->context->cmapAllocationBytes += $bytes + 128;
+        if ($this->context->cmapAllocationBytes > $this->options->maxCacheBytes) {
+            throw PdfParseException::resourceLimitExceeded('CMap allocation exceeds maxCacheBytes.');
+        }
+    }
+
+    private function accountIntermediateBytes(int $bytes): void
+    {
+        $this->context->intermediateDecodedBytes += $bytes;
+        $this->context->metrics['decoded_work_bytes'] = $this->context->intermediateDecodedBytes;
+        if ($this->context->intermediateDecodedBytes > $this->options->maxDecodedBytesTotal) {
+            throw PdfParseException::resourceLimitExceeded('Intermediate decoded data exceeds maxDecodedBytesTotal.');
+        }
     }
 
     private function guardDeadline(): void
@@ -976,413 +1134,93 @@ final class Parser
     private function collectIndirectObjects(string $content): array
     {
         $objects = [];
-
-        // Fast path: use xref table to jump directly to each object
-        $xrefOffsets = $this->parseXRefOffsets($content);
-        if ($xrefOffsets !== []) {
-            $contentLength = strlen($content);
-            foreach ($xrefOffsets as $id => $byteOffset) {
-                if ($id <= 0 || $byteOffset <= 0 || $byteOffset >= $contentLength) {
-                    continue;
-                }
-                $slice = substr($content, $byteOffset, 64);
-                if (!preg_match('/^\s*(\d+)\s+(\d+)\s+obj\b/', $slice, $m)) {
-                    continue;
-                }
-                $generation = (int) $m[2];
-                $bodyStart = $byteOffset + strlen($m[0]);
-                $endObjOffset = $this->locateEndObjOffset($content, $bodyStart);
-                if ($endObjOffset === null || $endObjOffset < $bodyStart) {
-                    continue;
-                }
-                $body = substr($content, $bodyStart, $endObjOffset - $bodyStart);
-                if ($body === false) {
-                    continue;
-                }
-                $objects[$id] = new PdfObject($id, $generation, $body, $byteOffset, false);
-            }
-            if ($objects !== []) {
-                return $objects;
-            }
-        }
-
-        // Fallback: full content scan
-        $objects = [];
-        if (
-            preg_match_all(
-                '/(?:^|[\r\n])(\d+)\s+(\d+)\s+obj\b/',
-                $content,
-                $matches,
-                PREG_SET_ORDER | PREG_OFFSET_CAPTURE
-            ) !== 1
-            && $matches === []
-        ) {
-            return [];
-        }
-
-        foreach ($matches as $match) {
+        $cursor = 0;
+        while (preg_match('/(?:^|[\r\n])(\d+)\s+(\d+)\s+obj\b/', $content, $match, PREG_OFFSET_CAPTURE, $cursor) === 1) {
+            $this->guardDeadline();
             $id = (int) $match[1][0];
-            $generation = (int) $match[2][0];
+            $bodyStart = $match[0][1] + strlen($match[0][0]);
+            $end = $this->locateEndObjOffset($content, $bodyStart);
+            if ($end === null) {
+                break;
+            }
+            $cursor = $end + 6;
             if ($id <= 0) {
                 continue;
             }
-
-            $objectStart = (int) $match[1][1];
-            $bodyStart = (int) $match[0][1] + strlen((string) $match[0][0]);
-            $endObjOffset = $this->locateEndObjOffset($content, $bodyStart);
-            if ($endObjOffset === null || $endObjOffset < $bodyStart) {
-                continue;
+            $this->assertObjectBudget(count($objects) + (isset($objects[$id]) ? 0 : 1));
+            if ($end - $bodyStart > $this->options->maxObjectBytes) {
+                throw PdfParseException::resourceLimitExceeded('PDF object exceeds maxObjectBytes.');
             }
-
-            $body = substr($content, $bodyStart, $endObjOffset - $bodyStart);
-            if ($body === false) {
-                continue;
-            }
-
-            if (!isset($objects[$id]) || $objects[$id]->offset <= $objectStart) {
-                $objects[$id] = new PdfObject($id, $generation, $body, $objectStart, false);
-            }
+            $objects[$id] = new PdfObject($id, (int) $match[2][0], substr($content, $bodyStart, $end - $bodyStart), $match[1][1], false);
         }
-
         return $objects;
     }
 
-    /**
-     * Parse cross-reference table/stream and return [objectId => byteOffset].
-     *
-     * @param  int $baseOffset  Absolute file offset of byte 0 of $content (0 for
-     *                          full-file content; $xrefOffset for the streaming path).
-     * @return array<int, int>
-     */
-    private function parseXRefOffsets(string $content, int $baseOffset = 0): array
+    private function locateEndObjOffset(string $content, int $searchOffset, array &$objects = []): ?int
     {
-        $contentLength = strlen($content);
-        $searchOffset = -min(1024, $contentLength);
-        $pos = strrpos($content, 'startxref', $searchOffset);
-        if ($pos === false) {
-            return [];
-        }
-
-        $afterStartXref = substr($content, $pos + 9, 64);
-        if (!preg_match('/\s+(\d+)/', $afterStartXref, $m)) {
-            return [];
-        }
-
-        $xrefAbsolute = (int) $m[1];
-        // Convert the absolute file offset to a position within this buffer
-        $xrefLocalOffset = $xrefAbsolute - $baseOffset;
-        if ($xrefLocalOffset < 0 || $xrefLocalOffset >= $contentLength) {
-            return [];
-        }
-
-        $objectOffsets = [];
-        $visitedOffsets = [];
-        $this->collectXRefEntries($content, $xrefLocalOffset, $objectOffsets, $visitedOffsets, $baseOffset);
-        return $objectOffsets;
-    }
-
-    /**
-     * @param array<int, int> $objectOffsets
-     * @param array<int, bool> $visitedOffsets
-     * @param int $baseOffset  Absolute file offset of byte 0 of $content.
-     */
-    private function collectXRefEntries(string $content, int $xrefLocalOffset, array &$objectOffsets, array &$visitedOffsets, int $baseOffset = 0): void
-    {
-        $contentLen = strlen($content);
-        $queue = [$xrefLocalOffset];
-
-        while ($queue !== []) {
-            $currentOffset = array_shift($queue);
-
-            if (isset($visitedOffsets[$currentOffset])) {
-                continue;
-            }
-            $visitedOffsets[$currentOffset] = true;
-
-            $slice = ltrim(substr($content, $currentOffset, 16));
-            $prevAbsolute = str_starts_with($slice, 'xref')
-                ? $this->parseTraditionalXRef($content, $currentOffset, $objectOffsets)
-                : $this->parseXRefStream($content, $currentOffset, $objectOffsets);
-
-            if ($prevAbsolute !== null && $prevAbsolute > 0) {
-                $prevLocalOffset = $prevAbsolute - $baseOffset;
-                if ($prevLocalOffset !== $currentOffset && $prevLocalOffset >= 0 && $prevLocalOffset < $contentLen) {
-                    $queue[] = $prevLocalOffset;
-                }
-            }
-        }
-    }
-
-    /**
-     * Parse a traditional (non-stream) cross-reference table.
-     * @param array<int, int> $objectOffsets
-     */
-    private function parseTraditionalXRef(string $content, int $startOffset, array &$objectOffsets): ?int
-    {
+        $cursor = $searchOffset;
         $length = strlen($content);
-        $pos = strpos($content, 'xref', $startOffset);
-        if ($pos === false) {
-            return null;
-        }
-        $pos += 4;
-
-        // Skip whitespace/EOL after 'xref'
-        while ($pos < $length && ($content[$pos] === ' ' || $content[$pos] === "\t" || $content[$pos] === "\r" || $content[$pos] === "\n")) {
-            $pos++;
-        }
-
-        // Parse subsections until 'trailer'
-        while ($pos < $length) {
-            if (substr($content, $pos, 7) === 'trailer') {
-                break;
-            }
-            // Subsection header: "startId count<EOL>"
-            if (!preg_match('/^(\d+)\s+(\d+)\s*[\r\n]+/', substr($content, $pos, 48), $headerMatch)) {
-                break;
-            }
-            $startId = (int) $headerMatch[1];
-            $count = (int) $headerMatch[2];
-            $pos += strlen($headerMatch[0]);
-
-            // Each in-use entry: nnnnnnnnnn ggggg n <2-byte-eol> (exactly 20 bytes)
-            for ($i = 0; $i < $count; $i++) {
-                if ($pos + 20 > $length) {
-                    break;
-                }
-                $entry = substr($content, $pos, 20);
-                $pos += 20;
-                if ($entry[17] !== 'n') {
-                    continue; // free entry
-                }
-                $objectId = $startId + $i;
-                $byteOffset = (int) substr($entry, 0, 10);
-                if (!isset($objectOffsets[$objectId])) {
-                    $objectOffsets[$objectId] = $byteOffset;
-                }
-            }
-        }
-
-        // Extract /Prev from trailer dictionary
-        if (substr($content, $pos, 7) === 'trailer') {
-            $trailerSlice = substr($content, $pos, 512);
-            if (preg_match('/\/Prev\s+(\d+)/', $trailerSlice, $prevMatch)) {
-                return (int) $prevMatch[1];
-            }
-        }
-        return null;
-    }
-
-    /**
-     * Parse a compressed cross-reference stream (PDF 1.5+).
-     * @param array<int, int> $objectOffsets
-     */
-    private function parseXRefStream(string $content, int $xrefOffset, array &$objectOffsets): ?int
-    {
-        if (!preg_match('/\d+\s+\d+\s+obj\b/', $content, $headerMatch, PREG_OFFSET_CAPTURE, $xrefOffset)) {
-            return null;
-        }
-        $bodyStart = (int) $headerMatch[0][1] + strlen($headerMatch[0][0]);
-        $endObjPos = strpos($content, 'endobj', $bodyStart);
-        if ($endObjPos === false) {
-            return null;
-        }
-
-        $objectBody = substr($content, $bodyStart, $endObjPos - $bodyStart);
-        $streamInfo = $this->extractStreamInfoFromObjectBody($objectBody, []);
-        if ($streamInfo === null) {
-            return null;
-        }
-
-        $warnings = [];
-        $decoded = $this->decodeStream($streamInfo['dictionary'], $streamInfo['stream'], $warnings, 0);
-        if ($decoded === '') {
-            return null;
-        }
-
-        $dict = $streamInfo['dictionary'];
-
-        // /W field widths: [type-width, offset-width, gen-width]
-        if (!preg_match('/\/W\s*\[([\s\d]+)\]/', $dict, $wMatch)) {
-            return null;
-        }
-        $wValues = array_values(array_filter(
-            array_map('intval', preg_split('/\s+/', trim($wMatch[1])) ?: []),
-            static fn(int $v): bool => true
-        ));
-        if (count($wValues) < 3) {
-            return null;
-        }
-        [$w0, $w1, $w2] = $wValues;
-        $entrySize = $w0 + $w1 + $w2;
-        if ($entrySize <= 0) {
-            return null;
-        }
-
-        $totalObjects = preg_match('/\/Size\s+(\d+)/', $dict, $sm) === 1 ? (int) $sm[1] : 0;
-
-        // /Index: pairs of [firstId, count]; defaults to [0, /Size]
-        $indexRanges = [];
-        if (preg_match('/\/Index\s*\[(.*?)\]/s', $dict, $indexMatch)) {
-            $tokens = array_values(array_filter(
-                preg_split('/\s+/', trim($indexMatch[1])) ?: [],
-                static fn(string $v): bool => $v !== ''
-            ));
-            for ($i = 0; $i + 1 < count($tokens); $i += 2) {
-                $indexRanges[] = [(int) $tokens[$i], (int) $tokens[$i + 1]];
-            }
-        }
-        if ($indexRanges === []) {
-            $indexRanges[] = [0, $totalObjects];
-        }
-
-        $dataOffset = 0;
-        $dataLen = strlen($decoded);
-        foreach ($indexRanges as [$startId, $rangeCount]) {
-            for ($i = 0; $i < $rangeCount; $i++) {
-                if ($dataOffset + $entrySize > $dataLen) {
-                    break 2;
-                }
-                $objectId = $startId + $i;
-
-                $type = 0;
-                for ($b = 0; $b < $w0; $b++) {
-                    $type = ($type << 8) | ord($decoded[$dataOffset++]);
-                }
-                if ($w0 === 0) {
-                    $type = 1; // default when field is absent
-                }
-
-                $field1 = 0;
-                for ($b = 0; $b < $w1; $b++) {
-                    $field1 = ($field1 << 8) | ord($decoded[$dataOffset++]);
-                }
-
-                $field2 = 0;
-                for ($b = 0; $b < $w2; $b++) {
-                    $field2 = ($field2 << 8) | ord($decoded[$dataOffset++]);
-                }
-
-                // type 1 = uncompressed object at byte offset $field1
-                // type 2 = compressed in obj stream (expandObjectStreams handles this)
-                if ($type === 1 && !isset($objectOffsets[$objectId])) {
-                    $objectOffsets[$objectId] = $field1;
-                }
-            }
-        }
-
-        if (preg_match('/\/Prev\s+(\d+)/', $dict, $prevMatch)) {
-            return (int) $prevMatch[1];
-        }
-        return null;
-    }
-
-    private function locateEndObjOffset(string $content, int $searchOffset): ?int
-    {
-        $length = strlen($content);
-        $cursor = max(0, $searchOffset);
-
+        $dictionary = '';
         while ($cursor < $length) {
-            // strpos is far faster than regex for the initial scan; confirm word boundary after
-            $rawEndObj = strpos($content, 'endobj', $cursor);
-            if ($rawEndObj === false) {
-                return null;
+            $this->guardDeadline();
+            $this->skipContentWhitespaceAndComments($content, $cursor);
+            if (substr($content, $cursor, 6) === 'endobj' && $this->tokenEndsAt($content, $cursor + 6)) {
+                return $cursor;
             }
-            // Verify \b boundary: preceding char must be non-word or start-of-string
-            $before = $rawEndObj > 0 ? $content[$rawEndObj - 1] : ' ';
-            $after  = isset($content[$rawEndObj + 6]) ? $content[$rawEndObj + 6] : ' ';
-            if (
-                (ctype_alnum($before) || $before === '_') ||
-                (ctype_alnum($after)  || $after  === '_')
-            ) {
-                $cursor = $rawEndObj + 1;
+            if (substr($content, $cursor, 6) === 'stream' && $this->tokenEndsAt($content, $cursor + 6)) {
+                $cursor += 6;
+                if (($content[$cursor] ?? '') === "\r") { $cursor++; }
+                if (($content[$cursor] ?? '') === "\n") { $cursor++; }
+                $start = $cursor;
+                $declared = $this->resolveStreamLength($dictionary, $objects);
+                if ($declared !== null) {
+                    if ($declared > $this->options->maxStreamBytes) {
+                        throw PdfParseException::resourceLimitExceeded('Compressed PDF stream exceeds maxStreamBytes.');
+                    }
+                    $cursor = $start + $declared;
+                    $this->skipContentWhitespaceAndComments($content, $cursor);
+                    if (substr($content, $cursor, 9) === 'endstream' && $this->tokenEndsAt($content, $cursor + 9)) {
+                        $cursor += 9;
+                        continue;
+                    }
+                }
+                // Bounded recovery for missing/incorrect Length. Require a real object terminator.
+                if (preg_match('/(?<![A-Za-z0-9_])endstream\s+endobj\b/', $content, $match, PREG_OFFSET_CAPTURE, $start) !== 1) {
+                    return null;
+                }
+                if ($match[0][1] - $start > $this->options->maxStreamBytes) {
+                    throw PdfParseException::resourceLimitExceeded('Recovered stream exceeds maxStreamBytes.');
+                }
+                $cursor = $match[0][1] + 9;
                 continue;
             }
-            $endObjOffset = $rawEndObj;
-
-            // Check whether a stream keyword precedes this endobj
-            $rawStream = strpos($content, 'stream', $cursor);
-            $hasStream = $rawStream !== false && $rawStream < $length;
-
-            if (!$hasStream) {
-                return $endObjOffset;
+            $start = $cursor;
+            $item = $this->readPdfArrayItem($content, $cursor);
+            if (str_starts_with($item, '<<')) { $dictionary = $item; }
+            if ($cursor <= $start) { return null; }
+            if ($cursor - $searchOffset > $this->options->maxObjectBytes) {
+                throw PdfParseException::resourceLimitExceeded('PDF object exceeds maxObjectBytes.');
             }
-
-            // Confirm the stream keyword is followed by CR, LF, or CRLF
-            $streamOffset = null;
-            $streamTokenLen = 0;
-            for ($sp = $rawStream; $sp !== false && $sp < $endObjOffset; ) {
-                $afterStream = $content[$sp + 6] ?? '';
-                $afterStream2 = $content[$sp + 7] ?? '';
-                if ($afterStream === "\n") {
-                    $streamOffset = $sp;
-                    $streamTokenLen = 7; // "stream\n"
-                    break;
-                }
-                if ($afterStream === "\r" && $afterStream2 === "\n") {
-                    $streamOffset = $sp;
-                    $streamTokenLen = 8; // "stream\r\n"
-                    break;
-                }
-                if ($afterStream === "\r") {
-                    $streamOffset = $sp;
-                    $streamTokenLen = 7; // "stream\r"
-                    break;
-                }
-                $sp = strpos($content, 'stream', $sp + 1);
-            }
-
-            if ($streamOffset === null || $streamOffset > $endObjOffset) {
-                return $endObjOffset;
-            }
-
-            $streamDataOffset = $streamOffset + $streamTokenLen;
-            $dictionary = substr($content, $cursor, $streamOffset - $cursor);
-            $declaredLength = $this->extractDirectStreamLength($dictionary === false ? '' : $dictionary);
-
-            if ($declaredLength !== null && $declaredLength >= 0) {
-                $cursor = min($length, $streamDataOffset + $declaredLength);
-            } else {
-                $cursor = $streamDataOffset;
-            }
-
-            // strpos for endstream, then check boundary
-            $rawEndStream = strpos($content, 'endstream', $cursor);
-            if ($rawEndStream === false) {
-                return $endObjOffset;
-            }
-            if ($rawEndStream > $endObjOffset) {
-                return $endObjOffset;
-            }
-
-            $cursor = $rawEndStream + 9;
         }
-
         return null;
+    }
+
+    private function tokenEndsAt(string $text, int $offset): bool
+    {
+        return !isset($text[$offset]) || $this->isPdfWhitespace($text[$offset]) || $this->isPdfDelimiter($text[$offset]);
     }
 
     private function extractDirectStreamLength(string $dictionary): ?int
     {
-        if (preg_match('/\/Length\s+(\d+)\b/', $dictionary, $matches) !== 1) {
-            return null;
-        }
-
-        return (int) $matches[1];
-    }
-
-    private function findPatternOffset(string $pattern, string $content, int $offset): ?int
-    {
-        if (preg_match($pattern, $content, $matches, PREG_OFFSET_CAPTURE, $offset) !== 1) {
-            return null;
-        }
-
-        return (int) $matches[0][1];
+        if (preg_match('/\/Length\s+\d+\s+\d+\s+R\b/', $dictionary) === 1) { return null; }
+        return $this->extractIntegerValue($dictionary, 'Length');
     }
 
     /**
      * @param array<int, PdfObject> $objects
      * @param string[] $warnings
      */
-    private function expandObjectStreams(array &$objects, array &$warnings): void
+    private function expandObjectStreams(array &$objects, array &$warnings, ?array $index = null): void
     {
         // Fast pre-check: avoid per-object regex when no ObjStm exists at all
         $hasObjStm = false;
@@ -1432,12 +1270,24 @@ final class Parser
                 continue;
             }
 
-            $count = min((int) $nMatch[1], 65535); // cap to prevent memory exhaustion via crafted /N
+            $count = (int) $nMatch[1];
+            $this->assertObjectBudget($count);
             $first = (int) $fMatch[1];
 
+            if ($first < 0 || $first > strlen($decoded)) {
+                $this->addWarning($warnings, 'Invalid object stream header length.');
+                continue;
+            }
             $header = substr($decoded, 0, $first);
             $objectData = substr($decoded, $first);
-            $tokens = preg_split('/\s+/', trim($header)) ?: [];
+            $tokens = [];
+            $headerOffset = 0;
+            for ($tokenIndex = 0; $tokenIndex < $count * 2; $tokenIndex++) {
+                if (($tokenIndex & 255) === 0) { $this->guardDeadline(); }
+                if (preg_match('/\G\s*(\d+)/', $header, $token, 0, $headerOffset) !== 1) { break; }
+                $tokens[] = $token[1];
+                $headerOffset += strlen($token[0]);
+            }
 
             if (count($tokens) < $count * 2) {
                 $this->addWarning($warnings, 'Object stream ' . $containerObject->id . ' index is shorter than expected.');
@@ -1449,6 +1299,12 @@ final class Parser
                     $this->guardDeadline();
                 }
                 $objectId = (int) $tokens[$i * 2];
+                if ($index !== null && (
+                    ($index['compressed'][$objectId]['stream_id'] ?? null) !== $containerObject->id ||
+                    ($index['compressed'][$objectId]['index'] ?? null) !== $i
+                )) {
+                    continue;
+                }
                 $offset = (int) $tokens[($i * 2) + 1];
                 $nextOffset = ($i + 1 < $count)
                     ? (int) $tokens[(($i + 1) * 2) + 1]
@@ -1484,7 +1340,7 @@ final class Parser
      * @param array<int, PdfObject> $objects
      * @return int[]
      */
-    private function resolvePageObjectIds(array $objects, ?int $toPage = null): array
+    private function resolvePageObjectIds(array &$objects, ?int $toPage = null): array
     {
         $limit = $toPage ?? PHP_INT_MAX;
         $catalogObject = null;
@@ -1534,7 +1390,7 @@ final class Parser
      */
     private function walkPageTree(
         int $objectId,
-        array $objects,
+        array &$objects,
         array &$seen,
         int $limit = PHP_INT_MAX,
         int $depth = 0
@@ -1585,9 +1441,9 @@ final class Parser
      * @param array<int, PdfObject> $objects
      * @param string[] $warnings
      */
-    private function extractPageText(int $pageObjectId, array $objects, array &$warnings): string
+    private function extractPageText(int $pageObjectId, array &$objects, array &$warnings): string
     {
-        if (!isset($objects[$pageObjectId])) {
+        if (!$this->ensureObject($pageObjectId, $objects)) {
             return '';
         }
 
@@ -1601,6 +1457,7 @@ final class Parser
         }
 
         $streamTexts = [];
+        $state = ['inside' => false, 'font' => null, 'stack' => [], 'operands' => []];
         foreach ($contentObjectIds as $contentObjectId) {
             if (!isset($objects[$contentObjectId])) {
                 continue;
@@ -1628,18 +1485,19 @@ final class Parser
                 $xObjectMap,
                 $objects,
                 $warnings,
-                []
+                [],
+                $state
             );
         }
 
-        return trim(implode("\n\n", array_filter($streamTexts, static fn(string $s): bool => trim($s) !== '')));
+        return trim(implode('', $streamTexts));
     }
 
     /**
      * @param array<int, PdfObject> $objects
      * @return array<string, int>
      */
-    private function buildPageXObjectMap(int $pageObjectId, string $pageBody, array $objects): array
+    private function buildPageXObjectMap(int $pageObjectId, string $pageBody, array &$objects): array
     {
         $xObjectMap = [];
         $resourceBodies = $this->resolveResourceDictionaryBodies($pageObjectId, $pageBody, $objects);
@@ -1656,31 +1514,32 @@ final class Parser
      * @param array<int, PdfObject> $objects
      * @return int[]
      */
-    private function resolvePageContentObjectIds(string $pageBody, array $objects): array
+    private function resolvePageContentObjectIds(string $pageBody, array &$objects): array
     {
         $ids = [];
         $visited = [];
+        $referenceCount = 0;
 
         if (preg_match('/\/Contents\s*\[(.*?)\]/s', $pageBody, $arrayMatch) === 1) {
-            preg_match_all('/(\d+)\s+\d+\s+R/', $arrayMatch[1], $refs);
-            foreach ($refs[1] as $refIdRaw) {
-                $refId = (int) $refIdRaw;
-                foreach ($this->resolveContentReferenceObjectIds($refId, $objects, $visited) as $streamId) {
+            $offset = 0;
+            while (preg_match('/(\d+)\s+\d+\s+R\b/', $arrayMatch[1], $ref, PREG_OFFSET_CAPTURE, $offset) === 1) {
+                $offset = $ref[0][1] + strlen($ref[0][0]);
+                foreach ($this->resolveContentReferenceObjectIds((int) $ref[1][0], $objects, $visited, $referenceCount) as $streamId) {
                     $ids[] = $streamId;
                 }
             }
 
-            return $this->uniqueIds($ids);
+            return $ids;
         }
 
         if (preg_match('/\/Contents\s+(\d+)\s+\d+\s+R/', $pageBody, $singleMatch) === 1) {
             $refId = (int) $singleMatch[1];
-            foreach ($this->resolveContentReferenceObjectIds($refId, $objects, $visited) as $streamId) {
+            foreach ($this->resolveContentReferenceObjectIds($refId, $objects, $visited, $referenceCount) as $streamId) {
                 $ids[] = $streamId;
             }
         }
 
-        return $this->uniqueIds($ids);
+        return $ids;
     }
 
     /**
@@ -1690,11 +1549,16 @@ final class Parser
      */
     private function resolveContentReferenceObjectIds(
         int $objectId,
-        array $objects,
-        array &$visited,
+        array &$objects,
+        array $visited,
+        int &$referenceCount,
         int $depth = 0
     ): array
     {
+        $this->guardDeadline();
+        if (++$referenceCount > $this->options->maxArrayElements) {
+            throw PdfParseException::resourceLimitExceeded('Page content references exceed maxArrayElements.');
+        }
         if ($depth > $this->options->maxRecursionDepth) {
             throw PdfParseException::resourceLimitExceeded('Content reference nesting exceeds maxRecursionDepth.');
         }
@@ -1703,7 +1567,7 @@ final class Parser
         }
         $visited[$objectId] = true;
 
-        if (!isset($objects[$objectId])) {
+        if (!$this->ensureObject($objectId, $objects)) {
             return [];
         }
 
@@ -1718,10 +1582,10 @@ final class Parser
 
         if (preg_match('/^\[(.*)\]$/s', $body, $arrayMatch) === 1) {
             $ids = [];
-            preg_match_all('/(\d+)\s+\d+\s+R/', $arrayMatch[1], $refs);
-            foreach ($refs[1] as $refIdRaw) {
-                $refId = (int) $refIdRaw;
-                foreach ($this->resolveContentReferenceObjectIds($refId, $objects, $visited, $depth + 1) as $streamId) {
+            $offset = 0;
+            while (preg_match('/(\d+)\s+\d+\s+R\b/', $arrayMatch[1], $ref, PREG_OFFSET_CAPTURE, $offset) === 1) {
+                $offset = $ref[0][1] + strlen($ref[0][0]);
+                foreach ($this->resolveContentReferenceObjectIds((int) $ref[1][0], $objects, $visited, $referenceCount, $depth + 1) as $streamId) {
                     $ids[] = $streamId;
                 }
             }
@@ -1730,30 +1594,10 @@ final class Parser
         }
 
         if (preg_match('/^(\d+)\s+\d+\s+R$/', $body, $singleRefMatch) === 1) {
-            return $this->resolveContentReferenceObjectIds((int) $singleRefMatch[1], $objects, $visited, $depth + 1);
+            return $this->resolveContentReferenceObjectIds((int) $singleRefMatch[1], $objects, $visited, $referenceCount, $depth + 1);
         }
 
         return [];
-    }
-
-    /**
-     * @param int[] $ids
-     * @return int[]
-     */
-    private function uniqueIds(array $ids): array
-    {
-        $seen = [];
-        $out = [];
-
-        foreach ($ids as $id) {
-            if (isset($seen[$id])) {
-                continue;
-            }
-            $seen[$id] = true;
-            $out[] = $id;
-        }
-
-        return $out;
     }
 
     /**
@@ -1761,7 +1605,7 @@ final class Parser
      * @param string[] $warnings
      * @return array<string, array{map: array<string, string>, max_code_bytes: int}>
      */
-    private function buildPageFontMaps(int $pageObjectId, string $pageBody, array $objects, array &$warnings): array
+    private function buildPageFontMaps(int $pageObjectId, string $pageBody, array &$objects, array &$warnings): array
     {
         $resourceBodies = $this->resolveResourceDictionaryBodies($pageObjectId, $pageBody, $objects);
         return $this->buildFontMapsFromResourceBodies($resourceBodies, $objects, $warnings);
@@ -1773,7 +1617,7 @@ final class Parser
      * @param string[] $warnings
      * @return array<string, array{map:array<string,string>,max_code_bytes:int,encoding_name:string,differences:array<int,string>,is_multibyte:bool,has_tounicode:bool}>
      */
-    private function buildFontMapsFromResourceBodies(array $resourceBodies, array $objects, array &$warnings): array
+    private function buildFontMapsFromResourceBodies(array $resourceBodies, array &$objects, array &$warnings): array
     {
         if ($resourceBodies === []) {
             return [];
@@ -1799,12 +1643,12 @@ final class Parser
             }
 
             foreach ($fontDictStrings as $fontDictContent) {
-                preg_match_all('/\/([A-Za-z0-9]+)\s+(\d+)\s+\d+\s+R/', $fontDictContent, $fontRefs, PREG_SET_ORDER);
+                preg_match_all('/\/([^\s\/<>\[\]\(\)\{\}%]+)\s+(\d+)\s+\d+\s+R/', $fontDictContent, $fontRefs, PREG_SET_ORDER);
                 foreach ($fontRefs as $fontRef) {
-                    $resourceName = $fontRef[1];
+                    $resourceName = $this->decodePdfNameEscapes($fontRef[1]);
                     $fontObjectId = (int) $fontRef[2];
 
-                    if (!isset($objects[$fontObjectId])) {
+                    if (!$this->ensureObject($fontObjectId, $objects)) {
                         continue;
                     }
 
@@ -1830,7 +1674,7 @@ final class Parser
      *     has_tounicode: bool
      * }
      */
-    private function buildFontMapData(int $fontObjectId, string $fontBody, array $objects, array &$warnings): array
+    private function buildFontMapData(int $fontObjectId, string $fontBody, array &$objects, array &$warnings): array
     {
         $cache = &$this->context->fontMapCache;
         if (array_key_exists($fontObjectId, $cache)) {
@@ -1852,7 +1696,7 @@ final class Parser
         }
 
         $toUnicodeObjectId = (int) $toUnicodeMatch[1];
-        if (!isset($objects[$toUnicodeObjectId])) {
+        if (!$this->ensureObject($toUnicodeObjectId, $objects)) {
             return $cache[$fontObjectId] = $mapData;
         }
 
@@ -1893,7 +1737,7 @@ final class Parser
      * @param array<int, PdfObject> $objects
      * @return string[]
      */
-    private function resolveResourceDictionaryBodies(int $pageObjectId, string $pageBody, array $objects): array
+    private function resolveResourceDictionaryBodies(int $pageObjectId, string $pageBody, array &$objects): array
     {
         if (isset($this->context->resourceBodiesCache[$pageObjectId])) {
             return $this->context->resourceBodiesCache[$pageObjectId];
@@ -1910,7 +1754,7 @@ final class Parser
 
         $currentPageId = $pageObjectId;
         $visited = [];
-        while (isset($objects[$currentPageId]) && !isset($visited[$currentPageId])) {
+        while (!isset($visited[$currentPageId]) && $this->ensureObject($currentPageId, $objects)) {
             $visited[$currentPageId] = true;
             $currentBody = $objects[$currentPageId]->body;
 
@@ -1935,7 +1779,7 @@ final class Parser
      * @param array<int, PdfObject> $objects
      * @return string[]
      */
-    private function extractResourceDictionaryBodiesFromObjectBody(string $objectBody, array $objects): array
+    private function extractResourceDictionaryBodiesFromObjectBody(string $objectBody, array &$objects): array
     {
         $bodies = [];
 
@@ -1978,7 +1822,7 @@ final class Parser
      * @param array<int, PdfObject> $objects
      * @param array<int, bool> $visited
      */
-    private function resolveResourceObjectBody(int $objectId, array $objects, array $visited): string
+    private function resolveResourceObjectBody(int $objectId, array &$objects, array $visited): string
     {
         return $this->resolveIndirectObjectBody($objectId, $objects, $visited);
     }
@@ -1987,12 +1831,12 @@ final class Parser
      * @param array<int, PdfObject> $objects
      * @param array<int, bool> $visited
      */
-    private function resolveIndirectObjectBody(int $objectId, array $objects, array $visited, int $depth = 0): string
+    private function resolveIndirectObjectBody(int $objectId, array &$objects, array $visited, int $depth = 0): string
     {
         if ($depth > $this->options->maxRecursionDepth) {
             throw PdfParseException::resourceLimitExceeded('Indirect object nesting exceeds maxRecursionDepth.');
         }
-        if (isset($visited[$objectId]) || !isset($objects[$objectId])) {
+        if (isset($visited[$objectId]) || !$this->ensureObject($objectId, $objects)) {
             return '';
         }
 
@@ -2020,12 +1864,12 @@ final class Parser
      * @param array<int, PdfObject> $objects
      * @param array<int, bool> $visited
      */
-    private function resolveIndirectObjectToken(int $objectId, array $objects, array $visited, int $depth = 0): string
+    private function resolveIndirectObjectToken(int $objectId, array &$objects, array $visited, int $depth = 0): string
     {
         if ($depth > $this->options->maxRecursionDepth) {
             throw PdfParseException::resourceLimitExceeded('Indirect object nesting exceeds maxRecursionDepth.');
         }
-        if (isset($visited[$objectId]) || !isset($objects[$objectId])) {
+        if (isset($visited[$objectId]) || !$this->ensureObject($objectId, $objects)) {
             return '';
         }
 
@@ -2045,7 +1889,7 @@ final class Parser
     /**
      * @return array<string, int>
      */
-    private function extractXObjectMapFromResourceDictionary(string $resourceBody, array $objects): array
+    private function extractXObjectMapFromResourceDictionary(string $resourceBody, array &$objects): array
     {
         $cacheKey = sha1($resourceBody);
         if (isset($this->context->resourceXObjectMapsCache[$cacheKey])) {
@@ -2084,7 +1928,7 @@ final class Parser
      *     is_multibyte: bool
      * }
      */
-    private function parseFontEncodingData(int $fontObjectId, string $fontBody, array $objects): array
+    private function parseFontEncodingData(int $fontObjectId, string $fontBody, array &$objects): array
     {
         $defaultEncodingName = $this->determineDefaultEncodingName($fontBody);
         $encodingName = $defaultEncodingName;
@@ -2183,23 +2027,21 @@ final class Parser
     private function parseDifferencesArray(string $differencesBody): array
     {
         $differences = [];
-        preg_match_all('/\/([^\s\/<>\[\]\(\)\{\}%]+)|(\d+)/', $differencesBody, $tokens, PREG_SET_ORDER);
-
         $currentCode = null;
-        foreach ($tokens as $token) {
-            if (($token[2] ?? '') !== '') {
-                $currentCode = (int) $token[2];
-                continue;
+        $offset = 0;
+        $count = 0;
+        while (preg_match('/\/([^\s\/<>\[\]\(\)\{\}%]+)|(\d+)/', $differencesBody, $token, PREG_OFFSET_CAPTURE, $offset) === 1) {
+            if (++$count > $this->options->maxArrayElements) {
+                throw PdfParseException::resourceLimitExceeded('Encoding Differences exceeds maxArrayElements.');
             }
-
-            if (($token[1] ?? '') === '' || $currentCode === null) {
-                continue;
+            if (($count & 255) === 0) { $this->guardDeadline(); }
+            $offset = $token[0][1] + strlen($token[0][0]);
+            if (($token[2][0] ?? '') !== '') {
+                $currentCode = (int) $token[2][0];
+            } elseif (($token[1][0] ?? '') !== '' && $currentCode !== null && $currentCode <= 255) {
+                $differences[$currentCode++] = $this->decodePdfNameEscapes($token[1][0]);
             }
-
-            $differences[$currentCode] = $this->decodePdfNameEscapes($token[1]);
-            $currentCode++;
         }
-
         return $differences;
     }
 
@@ -2219,137 +2061,50 @@ final class Parser
     {
         $map = [];
         $maxCodeBytes = 1;
-
-        preg_match_all('/beginbfchar(.*?)endbfchar/s', $cmap, $bfcharBlocks, PREG_SET_ORDER);
-        foreach ($bfcharBlocks as $block) {
-            preg_match_all('/<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>/', $block[1], $pairs, PREG_SET_ORDER);
-            foreach ($pairs as $pair) {
-                $src = strtoupper($pair[1]);
-                $dst = strtoupper($pair[2]);
-                $text = $this->hexToUtf8($dst);
-                if ($text === '') {
-                    continue;
-                }
-
-                $map[$src] = $text;
-                $maxCodeBytes = max($maxCodeBytes, intdiv(strlen($src), 2));
-            }
-        }
-
-        preg_match_all('/beginbfrange(.*?)endbfrange/s', $cmap, $bfrangeBlocks, PREG_SET_ORDER);
-        foreach ($bfrangeBlocks as $block) {
-            $blockContent = $block[1];
-
-            // First pass: extract all array-style entries, which may span multiple lines.
-            // Remove them from the block so the scalar pass does not re-process them.
-            if (
-                preg_match_all(
-                    '/<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>\s*\[([\s\S]*?)\]/s',
-                    $blockContent,
-                    $arrayRangeMatches,
-                    PREG_SET_ORDER
-                ) > 0
-            ) {
-                foreach ($arrayRangeMatches as $arrayRangeMatch) {
-                    $startCodeHex = strtoupper($arrayRangeMatch[1]);
-                    $endCodeHex = strtoupper($arrayRangeMatch[2]);
-                    $startCode = $this->parseCMapSourceCode($startCodeHex);
-                    $endCode = $this->parseCMapSourceCode($endCodeHex);
-                    if (
-                        $startCode === null
-                        || $endCode === null
-                        || $endCode < $startCode
-                        || ($endCode - $startCode) > 0xFFFF
-                    ) {
-                        continue;
-                    }
-                    $codeWidth = strlen($startCodeHex);
-
-                    preg_match_all('/<([0-9A-Fa-f]+)>/', $arrayRangeMatch[3], $destinations);
-                    $destinationHexValues = $destinations[1] ?? [];
-
-                    $index = 0;
-                    for ($code = $startCode; $code <= $endCode; $code++) {
-                        if (!isset($destinationHexValues[$index])) {
-                            break;
-                        }
-
-                        $sourceKey = strtoupper(str_pad(dechex($code), $codeWidth, '0', STR_PAD_LEFT));
-                        $destHex = strtoupper($destinationHexValues[$index]);
-                        $text = $this->hexToUtf8($destHex);
+        $blockOffset = 0;
+        while (preg_match('/begin(bfchar|bfrange)(.*?)end\1/s', $cmap, $block, PREG_OFFSET_CAPTURE, $blockOffset) === 1) {
+            $blockOffset = $block[0][1] + strlen($block[0][0]);
+            $range = $block[1][0] === 'bfrange';
+            $body = $block[2][0];
+            $offset = 0;
+            $pattern = $range
+                ? '/<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>\s*(?:<([0-9A-Fa-f]+)>|\[([^\]]*)\])/s'
+                : '/<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>/';
+            while (preg_match($pattern, $body, $entry, PREG_OFFSET_CAPTURE, $offset) === 1) {
+                $this->guardDeadline();
+                $offset = $entry[0][1] + strlen($entry[0][0]);
+                $source = strtoupper($entry[1][0]);
+                $start = $this->parseCMapSourceCode($source);
+                if ($start === null || strlen($source) % 2 !== 0) { continue; }
+                if (!$range) {
+                    $destination = $entry[2][0];
+                    $this->accountCMapEntry(strlen($source) + strlen($destination));
+                    $text = $this->hexToUtf8($destination);
+                    if ($text !== '') { $map[$source] = $text; }
+                } else {
+                    $end = $this->parseCMapSourceCode($entry[2][0]);
+                    if ($end === null || $end < $start || $end - $start > 0xFFFF) { continue; }
+                    $arrayOffset = 0;
+                    for ($code = $start; $code <= $end; $code++) {
+                        if (($entry[3][0] ?? '') !== '') {
+                            $destination = $this->incrementHexString($entry[3][0], $code - $start);
+                        } elseif (preg_match('/<([0-9A-Fa-f]+)>/', $entry[4][0] ?? '', $target, PREG_OFFSET_CAPTURE, $arrayOffset) === 1) {
+                            $arrayOffset = $target[0][1] + strlen($target[0][0]);
+                            $destination = $target[1][0];
+                        } else { break; }
+                        if ($destination === null) { continue; }
+                        $this->accountCMapEntry(strlen($source) + strlen($destination));
+                        $text = $this->hexToUtf8($destination);
                         if ($text !== '') {
-                            $map[$sourceKey] = $text;
-                            $maxCodeBytes = max($maxCodeBytes, intdiv(strlen($sourceKey), 2));
+                            $key = strtoupper(str_pad(dechex($code), strlen($source), '0', STR_PAD_LEFT));
+                            $map[$key] = $text;
                         }
-
-                        $index++;
                     }
                 }
-
-                // Strip array entries so the scalar pass below does not accidentally
-                // parse individual hex tokens from inside the array as a range.
-                $blockContent = preg_replace(
-                    '/<[0-9A-Fa-f]+>\s*<[0-9A-Fa-f]+>\s*\[[\s\S]*?\]/s',
-                    '',
-                    $blockContent
-                ) ?? $blockContent;
-            }
-
-            // Second pass: scalar entries  <startHex> <endHex> <firstValueHex>
-            $lines = preg_split('/[\r\n]+/', trim($blockContent)) ?: [];
-            foreach ($lines as $line) {
-                $line = trim($line);
-                if ($line === '') {
-                    continue;
-                }
-
-                if (
-                    preg_match('/<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>/', $line, $rangeMatch) !== 1
-                ) {
-                    continue;
-                }
-
-                $startCodeHex = strtoupper($rangeMatch[1]);
-                $endCodeHex = strtoupper($rangeMatch[2]);
-                $startValueHex = strtoupper($rangeMatch[3]);
-
-                $startCode = $this->parseCMapSourceCode($startCodeHex);
-                $endCode = $this->parseCMapSourceCode($endCodeHex);
-
-                // Reject implausible ranges produced by mismatched surrogate or
-                // binary data that leaked into the block content.
-                if (
-                    $startCode === null
-                    || $endCode === null
-                    || $endCode < $startCode
-                    || ($endCode - $startCode) > 0xFFFF
-                ) {
-                    continue;
-                }
-
-                $codeWidth = strlen($startCodeHex);
-
-                for ($code = $startCode; $code <= $endCode; $code++) {
-                    $sourceKey = strtoupper(str_pad(dechex($code), $codeWidth, '0', STR_PAD_LEFT));
-                    $destHex = $this->incrementHexString($startValueHex, $code - $startCode);
-                    if ($destHex === null) {
-                        continue;
-                    }
-                    $text = $this->hexToUtf8($destHex);
-                    if ($text === '') {
-                        continue;
-                    }
-
-                    $map[$sourceKey] = $text;
-                    $maxCodeBytes = max($maxCodeBytes, intdiv(strlen($sourceKey), 2));
-                }
+                $maxCodeBytes = max($maxCodeBytes, intdiv(strlen($source), 2));
             }
         }
-
-        return [
-            'map' => $map,
-            'max_code_bytes' => $maxCodeBytes,
-        ];
+        return ['map' => $map, 'max_code_bytes' => $maxCodeBytes];
     }
 
     /**
@@ -2406,9 +2161,14 @@ final class Parser
      * @param array<int, PdfObject> $objects
      * @return array{dictionary:string,stream:string}|null
      */
-    private function extractStreamInfoFromObjectBody(string $objectBody, array $objects = []): ?array
+    private function extractStreamInfoFromObjectBody(string $objectBody, array &$objects = []): ?array
     {
-        $streamPos = strpos($objectBody, 'stream');
+        $dictionary = $this->extractFirstDictionary($objectBody);
+        if ($dictionary === null) { return null; }
+        $dictionaryStart = strpos($objectBody, $dictionary);
+        $streamPos = $dictionaryStart + strlen($dictionary);
+        $this->skipContentWhitespaceAndComments($objectBody, $streamPos);
+        if (substr($objectBody, $streamPos, 6) !== 'stream') { return null; }
         if ($streamPos === false) {
             return null;
         }
@@ -2447,7 +2207,7 @@ final class Parser
     /**
      * @param array<int, PdfObject> $objects
      */
-    private function resolveStreamLength(string $dictionary, array $objects): ?int
+    private function resolveStreamLength(string $dictionary, array &$objects): ?int
     {
         if (preg_match('/\/Length\s+(\d+)\s+(\d+)\s+R\b/', $dictionary, $refMatch) === 1) {
             $lengthObjectId = (int) $refMatch[1];
@@ -2472,30 +2232,17 @@ final class Parser
 
     private function extractFirstDictionary(string $text): ?string
     {
-        $start = strpos($text, '<<');
-        if ($start === false) {
-            return null;
-        }
-
+        $offset = 0;
         $length = strlen($text);
-        $depth = 0;
-
-        for ($i = $start; $i < $length - 1; $i++) {
-            $two = $text[$i] . $text[$i + 1];
-            if ($two === '<<') {
-                $depth++;
-                $i++;
-                continue;
+        while ($offset < $length) {
+            $this->skipContentWhitespaceAndComments($text, $offset);
+            $start = $offset;
+            $item = $this->readPdfArrayItem($text, $offset);
+            if (str_starts_with($item, '<<')) {
+                return str_ends_with($item, '>>') ? $item : null;
             }
-            if ($two === '>>') {
-                $depth--;
-                $i++;
-                if ($depth === 0) {
-                    return substr($text, $start, $i - $start + 1);
-                }
-            }
+            if ($offset <= $start) { break; }
         }
-
         return null;
     }
 
@@ -2520,9 +2267,10 @@ final class Parser
 
         $filterPipeline = $this->parseFilterPipeline($dictionary);
         if ($filterPipeline === []) {
+            $this->accountIntermediateBytes(strlen($stream));
             $this->accountDecodedBytes(strlen($stream));
             if ($cacheResult && $objectId > 0) {
-                $this->context->decodedStreamCache[$objectId] = $stream;
+                $this->cacheStringResult('decodedStreamCache', $objectId, $stream);
             }
             return $stream;
         }
@@ -2553,6 +2301,7 @@ final class Parser
                 throw PdfParseException::resourceLimitExceeded('Decoded PDF stream exceeds maxStreamBytes.');
             }
 
+            $this->accountIntermediateBytes(strlen($result));
             $decoded = $result;
 
             if (in_array($filter, ['FlateDecode', 'Fl', 'LZWDecode', 'LZW'], true)) {
@@ -2570,7 +2319,7 @@ final class Parser
 
         $this->accountDecodedBytes(strlen($decoded));
         if ($cacheResult && $objectId > 0) {
-            $this->context->decodedStreamCache[$objectId] = $decoded;
+            $this->cacheStringResult('decodedStreamCache', $objectId, $decoded);
         }
 
         return $decoded;
@@ -2695,14 +2444,21 @@ final class Parser
                 break;
             }
 
+            if (count($items) >= $this->options->maxArrayElements) {
+                throw PdfParseException::resourceLimitExceeded('PDF array exceeds maxArrayElements.');
+            }
+            $this->guardDeadline();
             $items[] = $this->readPdfArrayItem($arrayBody, $offset);
         }
 
         return $items;
     }
 
-    private function readPdfArrayItem(string $text, int &$offset): string
+    private function readPdfArrayItem(string $text, int &$offset, int $nesting = 0): string
     {
+        if ($nesting > $this->options->maxRecursionDepth) {
+            throw PdfParseException::resourceLimitExceeded('Dictionary nesting exceeds maxRecursionDepth.');
+        }
         $length = strlen($text);
         if ($offset >= $length) {
             return '';
@@ -2716,6 +2472,12 @@ final class Parser
             $depth = 1;
 
             while ($offset < $length && $depth > 0) {
+                if ($nesting + $depth > $this->options->maxRecursionDepth) {
+                    throw PdfParseException::resourceLimitExceeded('Dictionary/array nesting exceeds maxRecursionDepth.');
+                }
+                if (($offset & 1023) === 0) { $this->guardDeadline(); }
+                $this->skipContentWhitespaceAndComments($text, $offset);
+                if ($offset >= $length) { break; }
                 $current = $text[$offset];
                 $next = $text[$offset + 1] ?? '';
 
@@ -2747,6 +2509,12 @@ final class Parser
             $depth = 1;
 
             while ($offset < $length && $depth > 0) {
+                if ($nesting + $depth > $this->options->maxRecursionDepth) {
+                    throw PdfParseException::resourceLimitExceeded('Dictionary/array nesting exceeds maxRecursionDepth.');
+                }
+                if (($offset & 1023) === 0) { $this->guardDeadline(); }
+                $this->skipContentWhitespaceAndComments($text, $offset);
+                if ($offset >= $length) { break; }
                 $current = $text[$offset];
 
                 if ($current === '[') {
@@ -2771,7 +2539,7 @@ final class Parser
                     ($offset + 1) < $length &&
                     $text[$offset + 1] === '<'
                 ) {
-                    $this->readPdfArrayItem($text, $offset);
+                    $this->readPdfArrayItem($text, $offset, $nesting + $depth);
                     continue;
                 }
 
@@ -2801,6 +2569,8 @@ final class Parser
         if ($char === '/') {
             $offset++;
             while ($offset < $length) {
+                $this->skipContentWhitespaceAndComments($text, $offset);
+                if ($offset >= $length) { break; }
                 $current = $text[$offset];
                 if ($this->isPdfWhitespace($current) || $this->isPdfDelimiter($current)) {
                     break;
@@ -2828,21 +2598,24 @@ final class Parser
 
     private function decodeFlate(string $stream): string|false
     {
-        $result = @zlib_decode($stream, $this->options->maxStreamBytes);
-        if ($result !== false) {
-            return $result;
+        foreach ([ZLIB_ENCODING_DEFLATE, ZLIB_ENCODING_GZIP, ZLIB_ENCODING_RAW] as $encoding) {
+            $inflater = inflate_init($encoding);
+            if ($inflater === false) { continue; }
+            $out = '';
+            for ($offset = 0, $length = strlen($stream); $offset < $length; $offset += 1024) {
+                $this->guardDeadline();
+                $part = @inflate_add($inflater, substr($stream, $offset, 1024), ZLIB_SYNC_FLUSH);
+                if ($part === false) { break; }
+                if (strlen($part) > $this->options->maxStreamBytes - strlen($out)) {
+                    throw PdfParseException::resourceLimitExceeded('Flate stream exceeds maxStreamBytes.');
+                }
+                if (strlen($out) + strlen($part) > $this->options->maxDecodedBytesTotal - $this->context->intermediateDecodedBytes) {
+                    throw PdfParseException::resourceLimitExceeded('Flate stream exceeds maxDecodedBytesTotal.');
+                }
+                $out .= $part;
+                if (inflate_get_status($inflater) === ZLIB_STREAM_END) { return $out; }
+            }
         }
-
-        $result = @gzuncompress($stream, $this->options->maxStreamBytes);
-        if ($result !== false) {
-            return $result;
-        }
-
-        $result = @gzinflate($stream, $this->options->maxStreamBytes);
-        if ($result !== false) {
-            return $result;
-        }
-
         return false;
     }
 
@@ -2887,11 +2660,15 @@ final class Parser
         $length = strlen($clean);
 
         for ($i = 0; $i < $length; $i++) {
+            if (($i & 1023) === 0) { $this->guardDeadline(); }
             $char = $clean[$i];
 
             if ($char === 'z') {
                 if ($group !== '') {
                     return false;
+                }
+                if (strlen($result) + 4 > $this->options->maxStreamBytes) {
+                    throw PdfParseException::resourceLimitExceeded('ASCII85 stream exceeds maxStreamBytes.');
                 }
                 $result .= "\x00\x00\x00\x00";
                 continue;
@@ -2934,8 +2711,9 @@ final class Parser
     /**
      * @param array<string, int> $decodeParams
      */
-    private function decodeLzw(string $stream, array $decodeParams): string|false
+    private function decodeLzw(string $stream, array $decodeParams, ?int &$consumedBytes = null): string|false
     {
+        $consumedBytes = null;
         $dataLength = strlen($stream);
         if ($dataLength === 0) {
             return '';
@@ -2989,6 +2767,7 @@ final class Parser
             }
 
             if ($code === $eodCode) {
+                $consumedBytes = $byteOffset;
                 break;
             }
 
@@ -3039,6 +2818,7 @@ final class Parser
         $offset = 0;
 
         while ($offset < $length) {
+            $this->guardDeadline();
             $runLength = ord($stream[$offset]);
             $offset++;
 
@@ -3093,6 +2873,7 @@ final class Parser
             return false;
         }
 
+        if ($colors > 65536 || $columns > 65536 || $bitsPerComponent > 16) { return false; }
         $bytesPerPixel = max(1, intdiv(($colors * $bitsPerComponent) + 7, 8));
         $rowBytes = intdiv(($columns * $colors * $bitsPerComponent) + 7, 8);
 
@@ -3122,6 +2903,7 @@ final class Parser
         $offset = 0;
 
         while ($offset < $length) {
+            $this->guardDeadline();
             $row = substr($data, $offset, $rowBytes);
             $rowLength = strlen($row);
             if ($rowLength === 0) {
@@ -3153,6 +2935,7 @@ final class Parser
         $previousRow = str_repeat("\x00", $rowBytes);
 
         while ($offset < $length) {
+            $this->guardDeadline();
             if ($offset + 1 > $length) {
                 break;
             }
@@ -3232,18 +3015,21 @@ final class Parser
         string $contentStream,
         array $fontMaps,
         array $xObjectMap,
-        array $objects,
+        array &$objects,
         array &$warnings,
-        array $formStack
+        array $formStack,
+        ?array &$state = null
     ): string
     {
         $offset = 0;
         $length = strlen($contentStream);
-        $operands = [];
+        $state ??= ['inside' => false, 'font' => null, 'stack' => [], 'operands' => []];
+        $operands = &$state['operands'];
         $parts = [];
-        $lastChar = '';
-        $insideTextObject = false;
-        $currentFont = null;
+        $state['last_char'] ??= '';
+        $lastChar = &$state['last_char'];
+        $insideTextObject = &$state['inside'];
+        $currentFont = &$state['font'];
 
         while ($offset < $length) {
             $token = $this->readContentToken($contentStream, $offset);
@@ -3268,6 +3054,21 @@ final class Parser
             }
 
             switch ($operator) {
+                case 'BI':
+                    $this->skipInlineImage($contentStream, $offset, $warnings);
+                    $operands = [];
+                    break;
+                case 'q':
+                    if (count($state['stack']) >= $this->options->maxRecursionDepth) {
+                        throw PdfParseException::resourceLimitExceeded('Graphics state exceeds maxRecursionDepth.');
+                    }
+                    $state['stack'][] = $currentFont;
+                    $operands = [];
+                    break;
+                case 'Q':
+                    if ($state['stack'] !== []) { $currentFont = array_pop($state['stack']); }
+                    $operands = [];
+                    break;
                 case 'BT':
                     $insideTextObject = true;
                     $operands = [];
@@ -3281,7 +3082,7 @@ final class Parser
                     if ($insideTextObject && $operands !== []) {
                         $text = $this->tokenToText($operands[count($operands) - 1], $currentFont, $fontMaps);
                         if ($text !== '') {
-                            $parts[] = $text;
+                            $this->appendTextPart($parts, $text);
                             $lastChar = $text[strlen($text) - 1];
                         }
                     }
@@ -3293,7 +3094,7 @@ final class Parser
                         if ($candidate['type'] === 'array') {
                             $tjText = $this->extractTextFromTJArray($candidate['value'], $currentFont, $fontMaps);
                             if ($tjText !== '') {
-                                $parts[] = $tjText;
+                                $this->appendTextPart($parts, $tjText);
                                 $lastChar = $tjText[strlen($tjText) - 1];
                             }
                         }
@@ -3306,7 +3107,7 @@ final class Parser
                         if ($operands !== []) {
                             $text = $this->tokenToText($operands[count($operands) - 1], $currentFont, $fontMaps);
                             if ($text !== '') {
-                                $parts[] = $text;
+                                $this->appendTextPart($parts, $text);
                                 $lastChar = $text[strlen($text) - 1];
                             }
                         }
@@ -3319,7 +3120,7 @@ final class Parser
                         if ($operands !== []) {
                             $text = $this->tokenToText($operands[count($operands) - 1], $currentFont, $fontMaps);
                             if ($text !== '') {
-                                $parts[] = $text;
+                                $this->appendTextPart($parts, $text);
                                 $lastChar = $text[strlen($text) - 1];
                             }
                         }
@@ -3375,10 +3176,10 @@ final class Parser
                             $formStack
                         );
                         if ($nestedText !== '') {
-                            if ($parts !== []) {
+                            if ($lastChar !== '') {
                                 $this->appendNewlineToArray($parts, $lastChar);
                             }
-                            $parts[] = $nestedText;
+                            $this->appendTextPart($parts, $nestedText);
                             $lastChar = $nestedText[strlen($nestedText) - 1];
                         }
                     }
@@ -3389,7 +3190,131 @@ final class Parser
             }
         }
 
-        return trim(implode('', $parts));
+        return implode('', $parts);
+    }
+
+    /** Skip inline image bytes without interpreting binary data as PDF operators. */
+    private function skipInlineImage(string $content, int &$offset, array &$warnings): void
+    {
+        $dictionary = [];
+        $items = 0;
+        while ($offset < strlen($content)) {
+            $key = $this->readContentToken($content, $offset);
+            if (($key['value'] ?? null) === 'ID' && ($key['type'] ?? null) === 'operator') { break; }
+            if (++$items > 64 || ($key['type'] ?? null) !== 'name') {
+                $this->addWarning($warnings, 'Malformed inline image dictionary; remaining content stream skipped.');
+                $offset = strlen($content);
+                return;
+            }
+            $dictionary[$key['value']] = $this->readContentToken($content, $offset);
+        }
+        if (($content[$offset] ?? '') === "\r" && ($content[$offset + 1] ?? '') === "\n") {
+            $offset += 2;
+        } elseif (isset($content[$offset]) && $this->isPdfWhitespace($content[$offset])) {
+            $offset++;
+        }
+        $start = $offset;
+        $filterToken = $dictionary['F'] ?? $dictionary['Filter'] ?? null;
+        if (($filterToken['type'] ?? null) === 'array') { $filterToken = $filterToken['value'][0] ?? null; }
+        $filter = $filterToken['value'] ?? '';
+        $end = null;
+        if ($filter === '') {
+            $width = (int) ($dictionary['W']['value'] ?? $dictionary['Width']['value'] ?? 0);
+            $height = (int) ($dictionary['H']['value'] ?? $dictionary['Height']['value'] ?? 0);
+            $mask = ($dictionary['IM']['value'] ?? $dictionary['ImageMask']['value'] ?? '') === 'true';
+            $bits = $mask ? 1 : (int) ($dictionary['BPC']['value'] ?? $dictionary['BitsPerComponent']['value'] ?? 0);
+            $space = $dictionary['CS']['value'] ?? $dictionary['ColorSpace']['value'] ?? '';
+            $colors = $mask ? 1 : match ($space) {
+                'G', 'DeviceGray' => 1, 'RGB', 'DeviceRGB' => 3, 'CMYK', 'DeviceCMYK' => 4, default => 0,
+            };
+            if ($width > 0 && $width <= 1_000_000 && $height > 0 && $height <= 1_000_000 && in_array($bits, [1, 2, 4, 8, 16], true) && $colors > 0) {
+                $bytes = intdiv($width * $bits * $colors + 7, 8) * $height;
+                if ($bytes > $this->options->maxStreamBytes) {
+                    throw PdfParseException::resourceLimitExceeded('Inline image exceeds maxStreamBytes.');
+                }
+                $end = $start + $bytes;
+            }
+        } elseif (in_array($filter, ['AHx', 'ASCIIHexDecode', 'A85', 'ASCII85Decode'], true)) {
+            $marker = in_array($filter, ['AHx', 'ASCIIHexDecode'], true) ? '>' : '~>';
+            $position = strpos($content, $marker, $start);
+            if ($position !== false) { $end = $position + strlen($marker); }
+        } elseif (in_array($filter, ['RL', 'RunLengthDecode'], true)) {
+            $position = $start;
+            while ($position < strlen($content)) {
+                $this->guardDeadline();
+                $run = ord($content[$position++]);
+                if ($run === 128) { $end = $position; break; }
+                $position += $run < 128 ? $run + 1 : 1;
+            }
+        } elseif (in_array($filter, ['DCT', 'DCTDecode'], true)) {
+            $end = $this->inlineJpegEnd($content, $start);
+        } elseif (in_array($filter, ['LZW', 'LZWDecode'], true)) {
+            $consumed = null;
+            $decoded = $this->decodeLzw(substr($content, $start), [], $consumed);
+            if ($decoded !== false && $consumed !== null) {
+                $this->accountIntermediateBytes(strlen($decoded));
+                $end = $start + $consumed;
+            }
+        } elseif (in_array($filter, ['Fl', 'FlateDecode'], true)) {
+            $inflater = inflate_init(ZLIB_ENCODING_DEFLATE);
+            if ($inflater !== false) {
+                $position = $start;
+                $decodedBytes = 0;
+                while ($position < strlen($content)) {
+                    $this->guardDeadline();
+                    $chunk = substr($content, $position, 1024);
+                    $decoded = @inflate_add($inflater, $chunk, ZLIB_SYNC_FLUSH);
+                    if ($decoded === false) { break; }
+                    $decodedBytes += strlen($decoded);
+                    if ($decodedBytes > $this->options->maxStreamBytes) {
+                        throw PdfParseException::resourceLimitExceeded('Inline image exceeds maxStreamBytes.');
+                    }
+                    $this->accountIntermediateBytes(strlen($decoded));
+                    if (inflate_get_status($inflater) === ZLIB_STREAM_END) {
+                        $end = $start + inflate_get_read_len($inflater);
+                        break;
+                    }
+                    $position += strlen($chunk);
+                }
+            }
+        }
+        if ($end !== null && $end - $start <= $this->options->maxStreamBytes && $end <= strlen($content)) {
+            $offset = $end;
+            $this->skipContentWhitespaceAndComments($content, $offset);
+            if (substr($content, $offset, 2) === 'EI' && $this->tokenEndsAt($content, $offset + 2)) {
+                $offset += 2;
+                return;
+            }
+        }
+        // Ambiguous binary boundaries cannot be recovered by guessing the first "EI".
+        $this->addWarning($warnings, 'Unsupported or malformed inline image; remaining content stream skipped.');
+        $offset = strlen($content);
+    }
+
+    private function inlineJpegEnd(string $content, int $start): ?int
+    {
+        if (substr($content, $start, 2) !== "\xFF\xD8") { return null; }
+        $offset = $start + 2;
+        $length = strlen($content);
+        while ($offset < $length) {
+            $this->guardDeadline();
+            $marker = strpos($content, "\xFF", $offset);
+            if ($marker === false) { return null; }
+            $offset = $marker + 1;
+            while (($content[$offset] ?? '') === "\xFF") { $offset++; }
+            if ($offset >= $length) { return null; }
+            $code = ord($content[$offset++]);
+            if ($offset - $start > $this->options->maxStreamBytes) {
+                throw PdfParseException::resourceLimitExceeded('Inline JPEG exceeds maxStreamBytes.');
+            }
+            if ($code === 0xD9) { return $offset; }
+            if ($code === 0 || $code === 1 || ($code >= 0xD0 && $code <= 0xD7)) { continue; }
+            if ($code === 0xD8 || $offset + 1 >= $length) { return null; }
+            $segmentLength = (ord($content[$offset]) << 8) | ord($content[$offset + 1]);
+            if ($segmentLength < 2 || $segmentLength > $length - $offset) { return null; }
+            $offset += $segmentLength;
+        }
+        return null;
     }
 
     private function extractLastNameOperand(array $operands): ?string
@@ -3421,7 +3346,7 @@ final class Parser
         string $xObjectName,
         array $xObjectMap,
         array $parentFontMaps,
-        array $objects,
+        array &$objects,
         array &$warnings,
         array $formStack
     ): string
@@ -3431,7 +3356,7 @@ final class Parser
         }
 
         $xObjectId = $xObjectMap[$xObjectName];
-        if (!isset($objects[$xObjectId])) {
+        if (!$this->ensureObject($xObjectId, $objects, true)) {
             return '';
         }
 
@@ -3496,7 +3421,7 @@ final class Parser
         );
 
         if ($hasOwnResources) {
-            $this->context->formTextCache[$xObjectId] = $text;
+            $this->cacheStringResult('formTextCache', $xObjectId, $text);
         }
 
         return $text;
@@ -3514,7 +3439,7 @@ final class Parser
             if ($token['type'] === 'string') {
                 $text = $this->decodeTextBytes($token['value'], $fontKey, $fontMaps);
                 if ($text !== '') {
-                    $parts[] = $text;
+                    $this->appendTextPart($parts, $text);
                 }
                 continue;
             }
@@ -3522,7 +3447,7 @@ final class Parser
             if ($token['type'] === 'number') {
                 $value = (float) $token['value'];
                 if ($value < -250) {
-                    $parts[] = ' ';
+                    $this->appendTextPart($parts, ' ');
                 }
             }
         }
@@ -3544,6 +3469,11 @@ final class Parser
                 return null;
             }
 
+            $this->context->metrics['content_tokens']++;
+            if ($this->context->metrics['content_tokens'] > $this->options->maxContentTokens) {
+                throw PdfParseException::resourceLimitExceeded('Content tokens exceed maxContentTokens.');
+            }
+            if ((((int) $this->context->metrics['content_tokens']) & 255) === 0) { $this->guardDeadline(); }
             $char = $content[$offset];
 
             if ($char === '(') {
@@ -3635,8 +3565,9 @@ final class Parser
      */
     private function decodeTextBytes(string $bytes, ?string $fontKey, array $fontMaps): string
     {
-        if ($bytes === '') {
-            return '';
+        if ($bytes === '') { return ''; }
+        if (strlen($bytes) > $this->options->maxExtractedTextBytes) {
+            throw PdfParseException::resourceLimitExceeded('Text operand exceeds maxExtractedTextBytes.');
         }
 
         if ($fontKey !== null && isset($fontMaps[$fontKey])) {
@@ -3959,7 +3890,7 @@ final class Parser
             foreach ($this->resolveMbEncodingCandidates($from) as $candidate) {
                 try {
                     $result = @mb_convert_encoding($bytes, 'UTF-8', $candidate);
-                } catch (Throwable) {
+                } catch (\Throwable) {
                     $result = false;
                 }
 
@@ -3973,7 +3904,7 @@ final class Parser
             foreach ($this->resolveEncodingCandidates($from) as $candidate) {
                 try {
                     $result = @iconv($candidate, 'UTF-8//IGNORE', $bytes);
-                } catch (Throwable) {
+                } catch (\Throwable) {
                     $result = false;
                 }
 
@@ -4093,7 +4024,7 @@ final class Parser
 
                 $code = substr($hex, $cursor, $charWidth);
                 if (isset($map[$code])) {
-                    $out .= $map[$code];
+                    $this->appendBoundedText($out, $map[$code]);
                     $cursor += $charWidth;
                     $matched = true;
                     break;
@@ -4149,31 +4080,25 @@ final class Parser
 
     private function hexToUtf8(string $hex): string
     {
-        if ($hex === '') {
-            return '';
-        }
-
-        if (strlen($hex) % 2 === 1) {
-            $hex = '0' . $hex;
-        }
-
+        if ($hex === '' || strlen($hex) % 4 !== 0) { return ''; }
         $bytes = @hex2bin($hex);
-        if ($bytes === false || $bytes === '') {
-            return '';
-        }
-
-        if (preg_match('//u', $bytes) === 1) {
-            return $bytes;
-        }
-
-        if (strlen($bytes) % 2 === 0) {
-            $converted = $this->convertEncoding($bytes, 'UTF-16BE');
-            if ($converted !== '') {
-                return $converted;
+        if ($bytes === false) { return ''; }
+        $out = '';
+        for ($i = 0, $length = strlen($bytes); $i < $length; $i += 2) {
+            if (($i & 4095) === 0) { $this->guardDeadline(); }
+            $code = (ord($bytes[$i]) << 8) | ord($bytes[$i + 1]);
+            if ($code >= 0xD800 && $code <= 0xDBFF) {
+                if ($i + 3 >= $length) { return ''; }
+                $low = (ord($bytes[$i + 2]) << 8) | ord($bytes[$i + 3]);
+                if ($low < 0xDC00 || $low > 0xDFFF) { return ''; }
+                $code = 0x10000 + (($code - 0xD800) << 10) + $low - 0xDC00;
+                $i += 2;
+            } elseif ($code >= 0xDC00 && $code <= 0xDFFF) {
+                return '';
             }
+            $out .= $this->unicodeCodePointToUtf8($code);
         }
-
-        return $this->convertEncoding($bytes, 'Windows-1252');
+        return $out;
     }
 
     private function sanitizeText(string $text): string
@@ -4189,30 +4114,30 @@ final class Parser
      */
     private function readArray(string $content, int &$offset): array
     {
-        $items = [];
-        $length = strlen($content);
-        $offset++; // skip '['
-
-        while ($offset < $length) {
-            $this->skipContentWhitespaceAndComments($content, $offset);
-            if ($offset >= $length) {
-                break;
-            }
-
-            if ($content[$offset] === ']') {
-                $offset++;
-                break;
-            }
-
-            $token = $this->readContentToken($content, $offset);
-            if ($token === null) {
-                break;
-            }
-
-            $items[] = $token;
+        if ($this->context->arrayDepth === 0) { $this->context->arrayElements = 0; }
+        if (++$this->context->arrayDepth > $this->options->maxRecursionDepth) {
+            $this->context->arrayDepth--;
+            throw PdfParseException::resourceLimitExceeded('Content array nesting exceeds maxRecursionDepth.');
         }
-
-        return $items;
+        try {
+            $items = [];
+            $length = strlen($content);
+            $offset++;
+            while ($offset < $length) {
+                $this->skipContentWhitespaceAndComments($content, $offset);
+                if ($offset >= $length) { break; }
+                if ($content[$offset] === ']') { $offset++; break; }
+                if (++$this->context->arrayElements > $this->options->maxArrayElements) {
+                    throw PdfParseException::resourceLimitExceeded('Content array exceeds maxArrayElements.');
+                }
+                $token = $this->readContentToken($content, $offset);
+                if ($token === null) { break; }
+                $items[] = $token;
+            }
+            return $items;
+        } finally {
+            $this->context->arrayDepth--;
+        }
     }
 
     private function readLiteralString(string $content, int &$offset): string
@@ -4223,6 +4148,17 @@ final class Parser
         $out = '';
 
         while ($offset < $length) {
+            if (($offset & 1023) === 0) { $this->guardDeadline(); }
+            $runLength = strcspn($content, "\\()", $offset, min(16384, $length - $offset));
+            if ($runLength > 0) {
+                $this->guardDeadline();
+                if ($runLength > $this->options->maxStreamBytes - strlen($out)) {
+                    throw PdfParseException::resourceLimitExceeded('String token exceeds maxStreamBytes.');
+                }
+                $out .= substr($content, $offset, $runLength);
+                $offset += $runLength;
+                continue;
+            }
             $char = $content[$offset];
             $offset++;
 
@@ -4306,6 +4242,7 @@ final class Parser
         $hex = '';
 
         while ($offset < $length) {
+            if (($offset & 1023) === 0) { $this->guardDeadline(); }
             $char = $content[$offset];
             $offset++;
 
@@ -4343,6 +4280,7 @@ final class Parser
         $start = $offset;
 
         while ($offset < $length) {
+            if (($offset & 1023) === 0) { $this->guardDeadline(); }
             $char = $content[$offset];
             if ($this->isPdfWhitespace($char) || $this->isPdfDelimiter($char)) {
                 break;
@@ -4350,7 +4288,7 @@ final class Parser
             $offset++;
         }
 
-        return substr($content, $start, $offset - $start);
+        return $this->decodePdfNameEscapes(substr($content, $start, $offset - $start));
     }
 
     private function readNumber(string $content, int &$offset): float
@@ -4397,6 +4335,7 @@ final class Parser
         $start = $offset;
 
         while ($offset < $length) {
+            if (($offset & 1023) === 0) { $this->guardDeadline(); }
             $char = $content[$offset];
             if ($this->isPdfWhitespace($char) || $this->isPdfDelimiter($char)) {
                 break;
@@ -4432,6 +4371,7 @@ final class Parser
         $length = strlen($content);
 
         while ($offset < $length) {
+            if (($offset & 1023) === 0) { $this->guardDeadline(); }
             $char = $content[$offset];
 
             if ($this->isPdfWhitespace($char)) {
@@ -4469,22 +4409,13 @@ final class Parser
             || $char === '%';
     }
 
-    private function appendNewline(string &$text): void
-    {
-        if ($text === '' || substr($text, -1) === "\n") {
-            return;
-        }
-
-        $text .= "\n";
-    }
-
     private function appendNewlineToArray(array &$parts, string &$lastChar): void
     {
-        if ($parts === [] || $lastChar === "\n") {
+        if ($lastChar === '' || $lastChar === "\n") {
             return;
         }
 
-        $parts[] = "\n";
+        $this->appendTextPart($parts, "\n");
         $lastChar = "\n";
     }
 

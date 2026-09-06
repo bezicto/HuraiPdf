@@ -45,12 +45,25 @@ final class ParseContext
         'object_bytes_read' => 0,
         'decoded_streams' => 0,
         'decoded_bytes' => 0,
+        'decoded_work_bytes' => 0,
         'content_operators' => 0,
+        'content_tokens' => 0,
+        'cmap_entries' => 0,
+        'generated_text_bytes' => 0,
+        'cache_bytes' => 0,
+        'cache_evictions' => 0,
+        'first_page_ms' => 0.0,
+        'recovery_path' => false,
         'duration_ms' => 0.0,
         'peak_memory_bytes' => 0,
     ];
 
     public readonly int $startedAtNanoseconds;
+
+    public int $arrayDepth = 0;
+    public int $arrayElements = 0;
+    public int $cmapAllocationBytes = 0;
+    public int $intermediateDecodedBytes = 0;
 
     public function __construct()
     {

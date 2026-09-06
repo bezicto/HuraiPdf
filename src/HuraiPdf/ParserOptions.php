@@ -29,6 +29,20 @@ final class ParserOptions
         public readonly int $maxWarnings = 1_000,
         /** Optional wall-clock deadline in seconds. */
         public readonly ?float $deadlineSeconds = null,
+        /** Maximum input bytes accepted, including full-file recovery. */
+        public readonly int $maxInputBytes = 256 * 1024 * 1024,
+        /** Maximum bytes in an indirect object, including its dictionary. */
+        public readonly int $maxObjectBytes = 101 * 1024 * 1024,
+        /** Maximum tokens read across content streams. */
+        public readonly int $maxContentTokens = 2_000_000,
+        /** Maximum elements retained in one content array. */
+        public readonly int $maxArrayElements = 20_000,
+        /** Maximum expanded mappings across all fonts in one operation. */
+        public readonly int $maxCMapEntries = 100_000,
+        /** Maximum generated text bytes, including intermediate Form expansion. */
+        public readonly int $maxExtractedTextBytes = 32 * 1024 * 1024,
+        /** Approximate retained cache allocation budget between pages. */
+        public readonly int $maxCacheBytes = 8 * 1024 * 1024,
     ) {
         if ($this->streamingThreshold < 0) {
             throw new \InvalidArgumentException('streamingThreshold must be zero or greater.');
@@ -48,13 +62,20 @@ final class ParserOptions
                 'maxContentOperators' => $this->maxContentOperators,
                 'maxRecursionDepth' => $this->maxRecursionDepth,
                 'maxWarnings' => $this->maxWarnings,
+                'maxInputBytes' => $this->maxInputBytes,
+                'maxObjectBytes' => $this->maxObjectBytes,
+                'maxContentTokens' => $this->maxContentTokens,
+                'maxArrayElements' => $this->maxArrayElements,
+                'maxCMapEntries' => $this->maxCMapEntries,
+                'maxExtractedTextBytes' => $this->maxExtractedTextBytes,
+                'maxCacheBytes' => $this->maxCacheBytes,
             ] as $name => $value
         ) {
             if ($value < 1) {
                 throw new \InvalidArgumentException($name . ' must be greater than zero.');
             }
         }
-        if ($this->deadlineSeconds !== null && $this->deadlineSeconds <= 0) {
+        if ($this->deadlineSeconds !== null && (!is_finite($this->deadlineSeconds) || $this->deadlineSeconds <= 0)) {
             throw new \InvalidArgumentException('deadlineSeconds must be greater than zero when provided.');
         }
     }

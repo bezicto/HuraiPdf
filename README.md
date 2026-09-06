@@ -21,7 +21,6 @@ A zero-dependency, pure-PHP PDF text extraction library compatible with PHP 8.3,
 - PHP **8.3, 8.4, or 8.5**
 - PHP extensions: `ctype` and `zlib`
 - Recommended: `mbstring` or `iconv` for legacy font encoding conversion
-- Web interface only: `fileinfo`
 
 ---
 
@@ -168,9 +167,33 @@ $parser = new Parser(new ParserOptions(
 ));
 ```
 
-Resource options default to 500,000 objects, 100,000 emitted pages, 100 MB per
-stream, 512 MB cumulative decoded data, 10 million content operators, recursion
-depth 64, and 1,000 retained warnings. `deadlineSeconds` is disabled by default.
+Resource budgets are checked during parsing and expansion:
+
+| Option | Default | What it bounds |
+|---|---:|---|
+| `maxInputBytes` | 256 MiB | Input file/string, including recovery |
+| `maxObjectBytes` | 101 MiB | One indirect object |
+| `maxStreamBytes` | 100 MiB | Compressed or decoded stream bytes |
+| `maxDecodedBytesTotal` | 512 MiB | Decoding work, including filter intermediates |
+| `maxObjects` | 500,000 | Indexed objects and bounded revision history |
+| `maxPages` | 100,000 | Emitted pages |
+| `maxContentOperators` | 10,000,000 | Executed content operators |
+| `maxContentTokens` | 2,000,000 | Tokens read, including array elements |
+| `maxArrayElements` | 20,000 | Elements across one operand array and its nested arrays; also bounds content-reference traversal per page |
+| `maxRecursionDepth` | 64 | Reference, array, dictionary, graphics-state and Form nesting |
+| `maxCMapSize` | 1 MiB | CMap source bytes; larger sources are truncated with a warning |
+| `maxCMapEntries` | 100,000 | Cumulative expanded mappings |
+| `maxExtractedTextBytes` | 32 MiB | Generated text, including intermediate Form/TJ text |
+| `maxCacheBytes` | 8 MiB | Estimated retained caches and CMap allocation |
+| `maxWarnings` | 1,000 | Retained warnings |
+| `deadlineSeconds` | `null` | Optional elapsed-time limit checked during parsing |
+
+Limits throw `PdfParseException::RESOURCE_LIMIT_EXCEEDED`. Generated-text and
+mapping budgets include repeated expansion work, so they can exceed the final
+output's byte/character count. Cache sizes are conservative estimates, not a PHP
+process memory guarantee. Size limits should fit the worker's PHP memory limit;
+retain an external worker time/memory limit for untrusted files. Individual native
+library calls cannot be interrupted midway by the parser's deadline.
 
 #### `parseFile(string $filePath, int $fromPage = 1, ?int $toPage = null): Document`
 
@@ -225,8 +248,9 @@ Throws the same `PdfParseException` cases as `parseFile()`, including `INVALID_P
 
 #### Incremental extraction
 
-`parseFilePages()` yields each page as soon as it is extracted. For large files,
-this avoids retaining all extracted page text in a `Document`:
+`parseFilePages()` reads indexed files lazily regardless of `streamingThreshold`
+and yields each page as it is extracted. This avoids retaining all extracted page
+text in a `Document`:
 
 ```php
 foreach ($parser->parseFilePages('large.pdf', 10, 20) as $pageNumber => $page) {
@@ -263,12 +287,24 @@ echo $metrics['duration_ms'];
 
 `getLastMetadata()` returns `pdf_version`, `is_encrypted`, `warnings`, and the
 number of pages actually emitted. Metadata and metrics are finalized even when a
-page generator is closed early.
+page generator is destroyed early. If you break out of a loop while retaining the
+generator variable, `unset($generator)` releases it.
+
+A parser supports one active operation at a time. Starting another parse while its
+generator is suspended throws `LogicException`; use a separate `Parser` for
+concurrent/interleaved work. Sequential reuse remains supported.
+
+Additional metrics include `content_tokens`, `cmap_entries`, `generated_text_bytes`,
+`decoded_work_bytes`, `cache_bytes`, `cache_evictions`, `first_page_ms`, and
+`recovery_path`. `object_bytes_read` counts object reads, not all xref/header I/O.
 
 For large files with a usable cross-reference table or stream, HuraiPdf loads the
 catalog, requested page-tree segment, and reachable page dependencies lazily.
-Malformed or unsupported cross-reference structures fall back to the compatible
-full-file parser.
+Malformed or unsupported cross-reference structures fall back to bounded full-file
+recovery with a warning and `recovery_path=true`. Recovery retains the input and
+selected pages; it does not provide the same memory behavior as indexed parsing.
+Both readers use the same revision index and honor current compressed objects and
+deleted entries. Unused image resources are not loaded for text extraction.
 
 ---
 
@@ -403,38 +439,32 @@ file_put_contents('invoice.json', json_encode($meta, JSON_PRETTY_PRINT | JSON_UN
 
 ## Web Interface
 
-The included `index.php` provides a browser-based upload form for quick testing.
-
-**Setup:**
-
-1. Ensure the `uploads/` and `output/` directories are writable by your web server.
-2. Serve the project root with PHP (built-in server, Apache, Nginx, etc.).
-3. Open the page in a browser, choose a PDF, and submit.
-
-**Using PHP's built-in server:**
+`index.php` is a standalone usage example. From the project directory, run:
 
 ```bash
-php -S localhost:8080
+php -d upload_max_filesize=64M -d post_max_size=65M -S 127.0.0.1:8080
 ```
 
-Then open `http://localhost:8080` in your browser.
+Open `http://127.0.0.1:8080`, choose a PDF, optionally select a page range and
+**Exclude numbers/digits**, then click **Upload and Extract**. No login,
+environment variables, Composer installation or separate document root is needed.
 
-**Limits imposed by the web interface:**
-- Max file size: **60 MB**
-- Accepted type: `application/pdf` only (validated by MIME type, magic bytes, and extension)
-- Max execution time: 300 seconds
-- Requested memory limit: 512 MB; on PHP 8.5, a lower server-level `max_memory_limit` takes precedence
-- Browser preview: first **100 KB**; complete text remains available through the output file
-- Optional **Exclude numbers/digits** checkbox removes ASCII digits from filtered output
+The example demonstrates `Parser`, `ParserOptions`, `extractFile()` and
+`StopWordFilter`. It parses PHP's temporary upload, writes text and JSON metadata
+to `output/`, and shows a preview with download links. The directory is created
+automatically and must be writable by PHP. The uploaded PDF is not retained.
 
-The web interface consumes pages incrementally, filters and writes each page
-directly to a temporary output, then atomically publishes the completed text and
-metadata files. The metadata records the `exclude_numbers` selection. Failed
-extractions remove partial output files.
+The sample accepts up to 60 MiB, limits generated text to 32 MiB and the preview
+to 100 KiB, and applies a 280-second parser deadline. Adjust PHP's upload limits
+and the constants in `index.php` to suit your environment.
 
-Output files are written to `output/`:
-- `<filename>.txt` — extracted plain text
-- `<filename>.json` — metadata (page count, PDF version, warnings, timestamps, etc.)
+This is a local learning example: output files are directly accessible and remain
+until you delete them. An application serving private documents should provide its
+own access controls and storage policy.
+
+Filtering produces ASCII keyword tokens rather than a lossless multilingual
+export. To retain the extracted text, use `$page->getText()` directly instead of
+calling `$filter->filter()` in the callback.
 
 ---
 
@@ -451,32 +481,12 @@ PHP 8.5 administrators can cap application-level memory changes with
 `max_memory_limit`. Ensure that server-level value is large enough for the PDFs
 you expect to process.
 
-## Development
-
-Install development dependencies and run the regression suite:
-
-```bash
-composer install
-composer test
-```
-
-Run the synthetic range/full-document benchmark:
-
-```bash
-composer benchmark
-```
-
-The benchmark reports elapsed time, page count, objects loaded versus indexed,
-object bytes read, decoded bytes, content operators, and peak memory. Production
-decisions should also be checked against a representative corpus of real PDFs.
-
----
-
 ## Limitations
 
 - **Scanned / image-only PDFs** — No OCR is performed. PDFs that contain only scanned images will return empty or minimal text.
 - **Encrypted / password-protected PDFs** — Encrypted PDFs are detected and flagged via `isEncrypted()`, but decryption is not supported. Text extraction will likely be empty or fail.
-- **Complex layouts** — Multi-column documents, tables, and text inside vector graphics may not preserve their visual reading order.
+- **Complex layouts** — Multi-column documents, tables, and positioned glyphs may differ in reading order, spacing, and word grouping from a visual PDF reader.
+- **Inline images** — Common unfiltered/Flate/ASCII85/ASCIIHex/RunLength/LZW/JPEG boundaries are handled. Ambiguous or unsupported image boundaries cause a warning and skip the remaining content stream rather than interpret binary bytes as text.
 - **Prototype status** — This is an evolving prototype. Edge cases in the PDF specification may not be handled.
 
 ---
@@ -485,7 +495,7 @@ decisions should also be checked against a representative corpus of real PDFs.
 
 ```
 .
-├── index.php                          # Web interface
+├── index.php                          # Standalone upload-and-extract example
 ├── src/
 │   └── HuraiPdf/
 │       ├── Parser.php                 # Main parsing engine
@@ -498,8 +508,7 @@ decisions should also be checked against a representative corpus of real PDFs.
 │       │   └── PdfParseException.php  # Custom exception
 │       └── Filter/
 │           └── StopWordFilter.php     # Stopword filter
-├── uploads/                           # Temp storage for uploaded PDFs
-└── output/                            # Extracted text and metadata output
+└── composer.json                      # Library metadata and PSR-4 autoloading
 ```
 
 ---

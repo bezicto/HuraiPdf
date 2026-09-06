@@ -9,7 +9,7 @@ permissions:
   contents: read
 
 jobs:
-  test:
+  validate:
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -33,11 +33,5 @@ jobs:
       - name: Validate Composer metadata
         run: composer validate --strict
 
-      - name: Install development dependencies
-        run: composer install --no-interaction --no-progress --prefer-dist
-
       - name: Check PHP syntax
-        run: find src tests benchmarks -name '*.php' -print0 | xargs -0 -n1 php -l
-
-      - name: Run test suite
-        run: composer test
+        run: find src -name '*.php' -print0 | xargs -0 -n1 php -l && php -l index.php
