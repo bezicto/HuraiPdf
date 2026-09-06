@@ -1,6 +1,4 @@
 /uploads/
 /output/
-/vendor/
-/.phpunit.result.cache
 .DS_Store
 **/.DS_Store

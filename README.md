@@ -1,6 +1,6 @@
 # HuraiPdf
 
-A zero-dependency, pure-PHP PDF text extraction library tested on PHP 8.3, 8.4, and 8.5.
+A zero-dependency, pure-PHP PDF text extraction library compatible with PHP 8.3, 8.4, and 8.5.
 
 ---
 
@@ -22,25 +22,12 @@ A zero-dependency, pure-PHP PDF text extraction library tested on PHP 8.3, 8.4, 
 - PHP extensions: `ctype` and `zlib`
 - Recommended: `mbstring` or `iconv` for legacy font encoding conversion
 - Web interface only: `fileinfo`
-- Composer (optional for library use, required for development and tests)
 
 ---
 
 ## Installation
 
-Clone the repository and install its development tools:
-
-```bash
-composer install
-```
-
-Applications using the clone can load the Composer autoloader:
-
-```php
-require __DIR__ . '/vendor/autoload.php';
-```
-
-Alternatively, register the autoloader manually without installing any packages:
+Clone or download the repository and register the dependency-free autoloader:
 
 ```php
 spl_autoload_register(static function (string $class): void {
@@ -352,21 +339,6 @@ you expect to process.
 
 ---
 
-## Development and compatibility tests
-
-Install the development dependencies and run the test suite:
-
-```bash
-composer install
-composer test
-```
-
-The test suite treats PHP warnings and deprecations as failures. GitHub Actions
-runs syntax checks and the full suite on PHP 8.3, 8.4, and 8.5 for every pull
-request and every push to `main`.
-
----
-
 ## Limitations
 
 - **Scanned / image-only PDFs** — No OCR is performed. PDFs that contain only scanned images will return empty or minimal text.
@@ -381,10 +353,6 @@ request and every push to `main`.
 ```
 .
 ├── index.php                          # Web interface
-├── composer.json                      # Runtime constraints and PSR-4 autoloading
-├── phpunit.xml.dist                   # Test configuration
-├── tests/                             # Automated regression tests
-├── .github/workflows/                 # PHP 8.3–8.5 compatibility CI
 ├── src/
 │   └── HuraiPdf/
 │       ├── Parser.php                 # Main parsing engine
