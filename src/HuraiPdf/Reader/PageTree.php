@@ -17,6 +17,7 @@ final class PageTree extends Subsystem
      * @param array{offsets:array<int,array{offset:int,generation:int,next:int}>,compressed:array<int,array{stream_id:int,index:int}>,root_id:?int,encrypted:bool} $index
      * @param InputSource $handle
      * @param string[] $warnings
+     * @param array<int, bool> $seen
      */
     public function walkPageTreeFromIndex(
         int $objectId,
@@ -29,7 +30,8 @@ final class PageTree extends Subsystem
         array $index,
         InputSource $handle,
         array &$warnings,
-        int $depth = 0
+        int $depth = 0,
+        array &$seen = []
     ): void {
         if ($depth > $this->options->maxRecursionDepth) {
             throw PdfParseException::resourceLimitExceeded('Page tree exceeds maxRecursionDepth.');
@@ -38,11 +40,13 @@ final class PageTree extends Subsystem
         if ($toPage !== null && $ordinal >= $toPage) {
             return;
         }
+        $this->visitNode($objectId, $seen);
         if (!$this->session->reader->loadObjectFromIndex($objectId, $objects, $index, $handle, $warnings)) {
             return;
         }
-        $body = $objects[$objectId]->body;
-        if (preg_match('/\/Type\s*\/Page\b/', $body) === 1 && preg_match('/\/Type\s*\/Pages\b/', $body) !== 1) {
+        $entries = $this->session->syntax->dictionaryEntries($objects[$objectId]->body);
+        $type = $this->session->encoding->decodePdfNameEscapes($entries['Type'] ?? '');
+        if ($type === '/Page') {
             $ordinal++;
             $pagesFound++;
             if ($ordinal >= $fromPage && ($toPage === null || $ordinal <= $toPage)) {
@@ -53,23 +57,15 @@ final class PageTree extends Subsystem
             }
             return;
         }
-        if (
-            preg_match('/\/Type\s*\/Pages\b/', $body) !== 1 ||
-            preg_match('/\/Kids\s*\[(.*?)\]/s', $body, $kidsMatch) !== 1
-        ) {
-            return;
-        }
-        preg_match_all('/(\d+)\s+\d+\s+R/', $kidsMatch[1], $references);
-        foreach ($references[1] as $childId) {
-            $childId = (int) $childId;
+        if ($type !== '/Pages') { return; }
+        foreach ($this->childIds($entries, $objects) as $childId) {
             if ($this->session->reader->loadObjectFromIndex($childId, $objects, $index, $handle, $warnings)) {
-                $childBody = $objects[$childId]->body;
-                if (
-                    preg_match('/\/Type\s*\/Pages\b/', $childBody) === 1 &&
-                    preg_match('/\/Count\s+(\d+)\b/', $childBody, $countMatch) === 1
-                ) {
-                    $subtreeCount = (int) $countMatch[1];
-                    if ($subtreeCount > 0 && $ordinal + $subtreeCount < $fromPage) {
+                $childEntries = $this->session->syntax->dictionaryEntries($objects[$childId]->body);
+                if ($this->session->encoding->decodePdfNameEscapes($childEntries['Type'] ?? '') === '/Pages'
+                    && preg_match('/^\d+$/', $childEntries['Count'] ?? '') === 1) {
+                    $subtreeCount = (int) $childEntries['Count'];
+                    if ($subtreeCount > 0 && $subtreeCount < $fromPage - $ordinal) {
+                        $this->visitNode($childId, $seen);
                         $ordinal += $subtreeCount;
                         $pagesFound += $subtreeCount;
                         continue;
@@ -87,7 +83,8 @@ final class PageTree extends Subsystem
                 $index,
                 $handle,
                 $warnings,
-                $depth + 1
+                $depth + 1,
+                $seen
             );
             if ($toPage !== null && $ordinal >= $toPage) {
                 break;
@@ -104,13 +101,13 @@ final class PageTree extends Subsystem
         $limit = $toPage ?? PHP_INT_MAX;
         $catalogObject = null;
         foreach ($objects as $object) {
-            if (str_contains($object->body, '/Catalog') && preg_match('/\/Type\s*\/Catalog\b/', $object->body)) {
+            if ($this->objectType($object) === '/Catalog') {
                 $catalogObject = $object;
                 break;
             }
         }
 
-        if ($catalogObject !== null && preg_match('/\/Pages\s+(\d+)\s+\d+\s+R/', $catalogObject->body, $m) === 1) {
+        if ($catalogObject !== null && preg_match('/^(\d+)\s+\d+\s+R$/', $this->session->syntax->dictionaryEntries($catalogObject->body)['Pages'] ?? '', $m) === 1) {
             $rootPagesId = (int) $m[1];
             $seen = [];
             $ordered = $this->walkPageTree($rootPagesId, $objects, $seen, $limit);
@@ -121,11 +118,7 @@ final class PageTree extends Subsystem
 
         $pages = [];
         foreach ($objects as $object) {
-            // str_contains pre-check avoids regex on objects that clearly lack /Page
-            if (
-                str_contains($object->body, '/Page') &&
-                preg_match('/\/Type\s*\/Page\b(?!s)/', $object->body)
-            ) {
+            if ($this->objectType($object) === '/Page') {
                 $pages[] = ['id' => $object->id, 'offset' => $object->offset];
             }
         }
@@ -159,32 +152,20 @@ final class PageTree extends Subsystem
             throw PdfParseException::resourceLimitExceeded('Page tree exceeds maxRecursionDepth.');
         }
         $this->session->budget->guardDeadline();
-        if (isset($seen[$objectId]) || !isset($objects[$objectId])) {
-            return [];
-        }
-
-        $seen[$objectId] = true;
-        $body = $objects[$objectId]->body;
-
-        if (preg_match('/\/Type\s*\/Page\b/', $body) && !preg_match('/\/Type\s*\/Pages\b/', $body)) {
+        $this->visitNode($objectId, $seen);
+        if (!isset($objects[$objectId])) { return []; }
+        $entries = $this->session->syntax->dictionaryEntries($objects[$objectId]->body);
+        $type = $this->session->encoding->decodePdfNameEscapes($entries['Type'] ?? '');
+        if ($type === '/Page') {
             return [$objectId];
         }
 
-        if (!preg_match('/\/Type\s*\/Pages\b/', $body)) {
-            return [];
-        }
-
-        if (!preg_match('/\/Kids\s*\[(.*?)\]/s', $body, $kidsMatch)) {
-            return [];
-        }
-
+        if ($type !== '/Pages') { return []; }
         $ids = [];
-        preg_match_all('/(\d+)\s+\d+\s+R/', $kidsMatch[1], $refMatches);
-        foreach ($refMatches[1] as $kidIdRaw) {
+        foreach ($this->childIds($entries, $objects) as $kidId) {
             if (count($ids) >= $limit) {
                 break;
             }
-            $kidId = (int) $kidIdRaw;
             foreach ($this->walkPageTree($kidId, $objects, $seen, $limit, $depth + 1) as $pageId) {
                 $ids[] = $pageId;
                 if (count($ids) >= $limit) {
@@ -194,5 +175,32 @@ final class PageTree extends Subsystem
         }
 
         return $ids;
+    }
+
+    /** Reject cycles and shared branches before they multiply traversal work. */
+    private function visitNode(int $objectId, array &$seen): void
+    {
+        if (isset($seen[$objectId])) {
+            throw PdfParseException::resourceLimitExceeded('Page tree contains a repeated object reference.');
+        }
+        $this->session->budget->assertObjectBudget(count($seen) + 1);
+        $seen[$objectId] = true;
+    }
+
+    private function objectType(PdfObject $object): string
+    {
+        return $this->session->encoding->decodePdfNameEscapes(
+            $this->session->syntax->dictionaryEntries($object->body)['Type'] ?? ''
+        );
+    }
+
+    /** @return \Generator<int> */
+    private function childIds(array $entries, array &$objects): \Generator
+    {
+        $kids = $entries['Kids'] ?? '';
+        if (preg_match('/^(\d+)\s+\d+\s+R$/', $kids, $ref) === 1) {
+            $kids = $this->session->resources->resolveIndirectObjectToken((int) $ref[1], $objects, []);
+        }
+        yield from $this->session->syntax->arrayReferenceIds($kids);
     }
 }

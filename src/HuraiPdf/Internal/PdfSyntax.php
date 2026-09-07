@@ -41,6 +41,34 @@ final class PdfSyntax extends Subsystem
         return $entries;
     }
 
+    /** Read references in an array without matching strings, comments or nested values.
+     * @return \Generator<int>
+     */
+    public function arrayReferenceIds(string $array): \Generator
+    {
+        $offset = 0;
+        $this->skipContentWhitespaceAndComments($array, $offset);
+        if (($array[$offset] ?? '') !== '[') { return; }
+        $offset++;
+        $count = 0;
+        while ($offset < strlen($array)) {
+            $this->skipContentWhitespaceAndComments($array, $offset);
+            if (($array[$offset] ?? '') === ']' || $offset >= strlen($array)) { break; }
+            $this->session->budget->guardDeadline();
+            if (++$count > $this->options->maxArrayElements) {
+                throw PdfParseException::resourceLimitExceeded('Reference array exceeds maxArrayElements.');
+            }
+            if (preg_match('/\G(\d+)\s+\d+\s+R\b/', $array, $ref, 0, $offset) === 1) {
+                $offset += strlen($ref[0]);
+                yield (int) $ref[1];
+            } else {
+                $start = $offset;
+                $this->readPdfArrayItem($array, $offset);
+                if ($offset <= $start) { break; }
+            }
+        }
+    }
+
     public function stringBytes(string $value): ?string
     {
         $offset = 0;

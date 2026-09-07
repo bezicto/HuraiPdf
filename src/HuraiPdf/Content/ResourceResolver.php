@@ -38,23 +38,15 @@ final class ResourceResolver extends Subsystem
         $visited = [];
         $referenceCount = 0;
 
-        if (preg_match('/\/Contents\s*\[(.*?)\]/s', $pageBody, $arrayMatch) === 1) {
-            $offset = 0;
-            while (preg_match('/(\d+)\s+\d+\s+R\b/', $arrayMatch[1], $ref, PREG_OFFSET_CAPTURE, $offset) === 1) {
-                $offset = $ref[0][1] + strlen($ref[0][0]);
-                foreach ($this->resolveContentReferenceObjectIds((int) $ref[1][0], $objects, $visited, $referenceCount) as $streamId) {
+        $contents = $this->session->syntax->dictionaryEntries($pageBody)['Contents'] ?? '';
+        if (str_starts_with($contents, '[')) {
+            foreach ($this->session->syntax->arrayReferenceIds($contents) as $refId) {
+                foreach ($this->resolveContentReferenceObjectIds($refId, $objects, $visited, $referenceCount) as $streamId) {
                     $ids[] = $streamId;
                 }
             }
-
-            return $ids;
-        }
-
-        if (preg_match('/\/Contents\s+(\d+)\s+\d+\s+R/', $pageBody, $singleMatch) === 1) {
-            $refId = (int) $singleMatch[1];
-            foreach ($this->resolveContentReferenceObjectIds($refId, $objects, $visited, $referenceCount) as $streamId) {
-                $ids[] = $streamId;
-            }
+        } elseif (preg_match('/^(\d+)\s+\d+\s+R$/', $contents, $ref) === 1) {
+            $ids = $this->resolveContentReferenceObjectIds((int) $ref[1], $objects, $visited, $referenceCount);
         }
 
         return $ids;
@@ -98,16 +90,13 @@ final class ResourceResolver extends Subsystem
             return [$objectId];
         }
 
-        if (preg_match('/^\[(.*)\]$/s', $body, $arrayMatch) === 1) {
+        if (str_starts_with($body, '[')) {
             $ids = [];
-            $offset = 0;
-            while (preg_match('/(\d+)\s+\d+\s+R\b/', $arrayMatch[1], $ref, PREG_OFFSET_CAPTURE, $offset) === 1) {
-                $offset = $ref[0][1] + strlen($ref[0][0]);
-                foreach ($this->resolveContentReferenceObjectIds((int) $ref[1][0], $objects, $visited, $referenceCount, $depth + 1) as $streamId) {
+            foreach ($this->session->syntax->arrayReferenceIds($body) as $refId) {
+                foreach ($this->resolveContentReferenceObjectIds($refId, $objects, $visited, $referenceCount, $depth + 1) as $streamId) {
                     $ids[] = $streamId;
                 }
             }
-
             return $ids;
         }
 

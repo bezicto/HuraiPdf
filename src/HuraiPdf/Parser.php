@@ -213,7 +213,7 @@ final class Parser
                 throw PdfParseException::noObjectsFound();
             }
             $catalogBody = $objects[$index['root_id']]->body;
-            if (preg_match('/\/Pages\s+(\d+)\s+\d+\s+R/', $catalogBody, $rootPagesMatch) !== 1) {
+            if (preg_match('/^(\d+)\s+\d+\s+R$/', $this->session->syntax->dictionaryEntries($catalogBody)['Pages'] ?? '', $rootPagesMatch) !== 1) {
                 throw PdfParseException::noPagesFound();
             }
 
