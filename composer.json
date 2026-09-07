@@ -1,5 +1,5 @@
 {
-    "name": "bezicto/hurai-pdf",
+    "name": "bezicto/huraipdf",
     "description": "A zero-runtime-dependency, pure-PHP PDF text extraction library.",
     "type": "library",
     "license": "MIT",
