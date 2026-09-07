@@ -247,6 +247,7 @@ Resource budgets are checked during parsing and expansion:
 | `maxCMapEntries` | 100,000 | Cumulative expanded mappings |
 | `maxExtractedTextBytes` | 32 MiB | Generated text, including intermediate Form/TJ text |
 | `maxCacheBytes` | 8 MiB | Estimated retained caches and CMap allocation |
+| `maxOperandBytes` | 16 MiB | Conservative allocation budget for live content operands, nested arrays and retained font names |
 | `maxWarnings` | 1,000 | Retained warnings |
 | `deadlineSeconds` | `null` | Optional elapsed-time limit checked during parsing |
 
@@ -623,7 +624,10 @@ you expect to process.
 
 ## Verification
 
-CI validates Composer metadata and checks PHP syntax on PHP 8.3, 8.4, and 8.5.
+CI validates Composer metadata, checks PHP syntax, and runs the regression suite
+on PHP 8.3, 8.4, and 8.5, including runs without optional encoding functions
+and simulated missing OpenSSL. Isolated 64 MiB workers verify that oversized
+content operands fail with catchable resource-limit exceptions.
 The local `tests/` directory is excluded from Git and is not included in GitHub
 checkouts. Developers who retain the local suite can run `php tests/run.php`.
 

@@ -18,7 +18,8 @@ final class StreamDecoder extends Subsystem
         string $stream,
         array &$warnings,
         int $objectId,
-        bool $cacheResult = false
+        bool $cacheResult = false,
+        array &$objects = []
     ): string
     {
         $this->session->budget->guardDeadline();
@@ -30,7 +31,7 @@ final class StreamDecoder extends Subsystem
         }
 
         if ($this->context->security !== null && $objectId > 0 && $objectId !== $this->context->encryptionObjectId) {
-            $plain = $this->context->security->decryptStream($stream, $objectId, $this->context->objectGenerations[$objectId] ?? 0, $dictionary);
+            $plain = $this->context->security->decryptStream($stream, $objectId, $this->context->objectGenerations[$objectId] ?? 0, $dictionary, $objects);
             if ($plain === false) {
                 $this->session->budget->addWarning($warnings, 'Stream decryption failed on object ' . $objectId . '.');
                 return '';
@@ -38,7 +39,7 @@ final class StreamDecoder extends Subsystem
             $stream = $plain;
         }
 
-        $filterPipeline = $this->parseFilterPipeline($dictionary);
+        $filterPipeline = $this->parseFilterPipeline($dictionary, $objects);
         if ($filterPipeline === []) {
             $this->session->budget->accountIntermediateBytes(strlen($stream));
             $this->session->budget->accountDecodedBytes(strlen($stream));
@@ -102,105 +103,29 @@ final class StreamDecoder extends Subsystem
     /**
      * @return array<int, array{filter: string, decode_params: array<string, int>}>
      */
-    private function parseFilterPipeline(string $dictionary): array
+    private function parseFilterPipeline(string $dictionary, array &$objects): array
     {
-        $filters = [];
-
-        if (preg_match('/\/Filter\s*\[(.*?)\]/s', $dictionary, $arrayMatch) === 1) {
-            preg_match_all('/\/([A-Za-z0-9]+)/', $arrayMatch[1], $matches);
-            $filters = $matches[1] ?? [];
-        } elseif (preg_match('/\/Filter\s*\/([A-Za-z0-9]+)/', $dictionary, $singleMatch) === 1) {
-            $filters = [$singleMatch[1]];
-        }
-
-        if ($filters === []) {
-            return [];
-        }
-
-        $decodeParamsByIndex = [];
-        if (preg_match('/\/DecodeParms\s*\[(.*?)\]/s', $dictionary, $decodeParmsArrayMatch) === 1) {
-            $decodeParamsByIndex = $this->parseDecodeParmsArray($decodeParmsArrayMatch[1]);
-        } elseif (preg_match('/\/DecodeParms\s*<<((?:[^>]|>(?!>))*+)>>/s', $dictionary, $decodeParmsDictMatch) === 1) {
-            $decodeParamsByIndex[0] = $this->parseDecodeParmsDictionary('<<' . $decodeParmsDictMatch[1] . '>>');
-        } elseif (preg_match('/\/DP\s*\[(.*?)\]/s', $dictionary, $dpArrayMatch) === 1) {
-            $decodeParamsByIndex = $this->parseDecodeParmsArray($dpArrayMatch[1]);
-        } elseif (preg_match('/\/DP\s*<<((?:[^>]|>(?!>))*+)>>/s', $dictionary, $dpDictMatch) === 1) {
-            $decodeParamsByIndex[0] = $this->parseDecodeParmsDictionary('<<' . $dpDictMatch[1] . '>>');
-        }
-
+        $entries = $this->session->syntax->dictionaryEntries($dictionary);
+        $filter = $this->session->resources->resolveValue($entries['Filter'] ?? '', $objects);
+        if (!isset($entries['Filter']) || $filter === 'null') { return []; }
+        $filters = str_starts_with($filter, '[')
+            ? $this->session->syntax->parsePdfArrayItems(substr($filter, 1, -1)) : [$filter];
+        $params = $this->session->resources->resolveValue($entries['DecodeParms'] ?? $entries['DP'] ?? '', $objects);
+        $params = str_starts_with($params, '[')
+            ? $this->session->syntax->parsePdfArrayItems(substr($params, 1, -1)) : [$params];
         $pipeline = [];
-        foreach ($filters as $index => $filter) {
-            $pipeline[] = [
-                'filter' => $filter,
-                'decode_params' => $decodeParamsByIndex[$index] ?? [],
-            ];
+        foreach ($filters as $index => $value) {
+            $name = $this->session->syntax->nameValue($this->session->resources->resolveValue($value, $objects));
+            $dictionary = $this->session->resources->resolveValue($params[$index] ?? '', $objects);
+            $entries = $this->session->syntax->dictionaryEntries($dictionary);
+            $decodeParams = [];
+            foreach (['Predictor' => 1, 'Colors' => 1, 'BitsPerComponent' => 8, 'Columns' => 1, 'EarlyChange' => 1] as $key => $default) {
+                $raw = $this->session->resources->resolveValue($entries[$key] ?? ($key === 'BitsPerComponent' ? ($entries['BPC'] ?? '') : ''), $objects);
+                $decodeParams[$key] = preg_match('/^[+-]?\d+$/', $raw) === 1 ? (int) $raw : $default;
+            }
+            $pipeline[] = ['filter' => $name !== '' ? $name : 'InvalidFilter', 'decode_params' => $decodeParams];
         }
-
         return $pipeline;
-    }
-
-    /**
-     * @return array<int, array<string, int>>
-     */
-    private function parseDecodeParmsArray(string $decodeParmsArrayBody): array
-    {
-        $items = $this->session->syntax->parsePdfArrayItems($decodeParmsArrayBody);
-        $params = [];
-
-        foreach ($items as $index => $item) {
-            $trimmed = trim($item);
-            if ($trimmed === '' || $trimmed === 'null') {
-                $params[$index] = [];
-                continue;
-            }
-
-            if (str_starts_with($trimmed, '<<') && str_contains($trimmed, '>>')) {
-                $params[$index] = $this->parseDecodeParmsDictionary($trimmed);
-                continue;
-            }
-
-            $params[$index] = [];
-        }
-
-        return $params;
-    }
-
-    /**
-     * @return array<string, int>
-     */
-    private function parseDecodeParmsDictionary(string $dictionaryBody): array
-    {
-        return [
-            'Predictor' => $this->parseIntegerDictionaryValueAliases($dictionaryBody, ['Predictor'], 1),
-            'Colors' => $this->parseIntegerDictionaryValueAliases($dictionaryBody, ['Colors'], 1),
-            'BitsPerComponent' => $this->parseIntegerDictionaryValueAliases($dictionaryBody, ['BitsPerComponent', 'BPC'], 8),
-            'Columns' => $this->parseIntegerDictionaryValueAliases($dictionaryBody, ['Columns'], 1),
-            'EarlyChange' => $this->parseIntegerDictionaryValueAliases($dictionaryBody, ['EarlyChange'], 1),
-        ];
-    }
-
-    /**
-     * @param string[] $keys
-     */
-    private function parseIntegerDictionaryValueAliases(string $dictionaryBody, array $keys, int $default): int
-    {
-        foreach ($keys as $key) {
-            $value = $this->parseIntegerDictionaryValue($dictionaryBody, $key, PHP_INT_MIN);
-            if ($value !== PHP_INT_MIN) {
-                return $value;
-            }
-        }
-
-        return $default;
-    }
-
-    private function parseIntegerDictionaryValue(string $dictionaryBody, string $key, int $default): int
-    {
-        if (preg_match('/\/' . preg_quote($key, '/') . '\s+(-?\d+)/', $dictionaryBody, $match) === 1) {
-            return (int) $match[1];
-        }
-
-        return $default;
     }
 
     private function decodeFlate(string $stream): string|false

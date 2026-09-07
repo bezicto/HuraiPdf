@@ -11,6 +11,9 @@ use HuraiPdf\Internal\Subsystem;
 /** @internal */
 final class ResourceResolver extends Subsystem
 {
+    /** @var array<int, true> */
+    private array $resolvingValues = [];
+
     /**
      * @param array<int, PdfObject> $objects
      * @return array<string, int>
@@ -136,33 +139,12 @@ final class ResourceResolver extends Subsystem
 
         $fontMaps = [];
         foreach ($resourceBodies as $resourceBody) {
-            $fontDictStrings = [];
-
-            if (preg_match('/\/Font\s*<<((?:[^>]|>(?!>))*+)>>/s', $resourceBody, $fontDictMatch) === 1) {
-                $fontDictStrings[] = $fontDictMatch[1];
-            }
-
-            if (preg_match('/\/Font\s+(\d+)\s+\d+\s+R/', $resourceBody, $fontRefMatch) === 1) {
-                $resolvedBody = $this->resolveIndirectObjectBody((int) $fontRefMatch[1], $objects, []);
-                if ($resolvedBody !== '') {
-                    $fontDictStrings[] = $resolvedBody;
-                }
-            }
-
-            foreach ($fontDictStrings as $fontDictContent) {
-                preg_match_all('/\/([^\s\/<>\[\]\(\)\{\}%]+)\s+(\d+)\s+\d+\s+R/', $fontDictContent, $fontRefs, PREG_SET_ORDER);
-                foreach ($fontRefs as $fontRef) {
-                    $resourceName = $this->session->encoding->decodePdfNameEscapes($fontRef[1]);
-                    $fontObjectId = (int) $fontRef[2];
-
-                    if (!$this->session->reader->ensureObject($fontObjectId, $objects)) {
-                        continue;
-                    }
-
-                    $fontBody = $objects[$fontObjectId]->body;
-                    $mapData = $this->buildFontMapData($fontObjectId, $fontBody, $objects, $warnings);
-                    $fontMaps[$resourceName] = $mapData;
-                }
+            $fontDictionary = $this->resolveValue($this->session->syntax->dictionaryEntries($resourceBody)['Font'] ?? '', $objects);
+            foreach ($this->session->syntax->dictionaryEntries($fontDictionary) as $resourceName => $value) {
+                if (preg_match('/^(\d+)\s+\d+\s+R$/', $value, $ref) !== 1) { continue; }
+                $fontObjectId = (int) $ref[1];
+                if (!$this->session->reader->ensureObject($fontObjectId, $objects)) { continue; }
+                $fontMaps[$resourceName] = $this->buildFontMapData($fontObjectId, $objects[$fontObjectId]->body, $objects, $warnings);
             }
         }
 
@@ -198,7 +180,7 @@ final class ResourceResolver extends Subsystem
             'has_tounicode' => false,
         ];
 
-        if (preg_match('/\/ToUnicode\s+(\d+)\s+\d+\s+R/', $fontBody, $toUnicodeMatch) !== 1) {
+        if (preg_match('/^(\d+)\s+\d+\s+R$/', $this->session->syntax->dictionaryEntries($fontBody)['ToUnicode'] ?? '', $toUnicodeMatch) !== 1) {
             return $cache[$fontObjectId] = $mapData;
         }
 
@@ -216,7 +198,8 @@ final class ResourceResolver extends Subsystem
             $streamInfo['dictionary'],
             $streamInfo['stream'],
             $warnings,
-            $toUnicodeObjectId
+            $toUnicodeObjectId,
+            objects: $objects
         );
 
         if ($decodedCMap === '') {
@@ -272,7 +255,7 @@ final class ResourceResolver extends Subsystem
                 break;
             }
 
-            if (preg_match('/\/Parent\s+(\d+)\s+\d+\s+R/', $currentBody, $parentMatch) !== 1) {
+            if (preg_match('/^(\d+)\s+\d+\s+R$/', $this->session->syntax->dictionaryEntries($currentBody)['Parent'] ?? '', $parentMatch) !== 1) {
                 break;
             }
 
@@ -288,83 +271,20 @@ final class ResourceResolver extends Subsystem
      */
     public function extractResourceDictionaryBodiesFromObjectBody(string $objectBody, array &$objects): array
     {
-        $bodies = [];
-
-        $inlineResourceDictionary = $this->extractInlineDictionaryForKey($objectBody, 'Resources');
-        if ($inlineResourceDictionary !== '') {
-            $bodies[] = $inlineResourceDictionary;
-        }
-
-        if (preg_match('/\/Resources\s+(\d+)\s+\d+\s+R/', $objectBody, $refMatch) === 1) {
-            $resourceObjectBody = $this->resolveResourceObjectBody((int) $refMatch[1], $objects, []);
-            if ($resourceObjectBody !== '') {
-                $bodies[] = $resourceObjectBody;
-            }
-        }
-
-        return $bodies;
+        $value = $this->resolveValue($this->session->syntax->dictionaryEntries($objectBody)['Resources'] ?? '', $objects);
+        return str_starts_with($value, '<<') ? [$value] : [];
     }
 
-    private function extractInlineDictionaryForKey(string $body, string $key): string
+    public function resolveValue(string $value, array &$objects): string
     {
-        if (preg_match('/\/' . preg_quote($key, '/') . '\s*<</s', $body, $match, PREG_OFFSET_CAPTURE) !== 1) {
-            return '';
+        if (preg_match('/^(\d+)\s+\d+\s+R$/', $value, $ref) !== 1) { return $value; }
+        $id = (int) $ref[1];
+        if (isset($this->resolvingValues[$id]) || count($this->resolvingValues) >= $this->options->maxRecursionDepth) {
+            throw PdfParseException::resourceLimitExceeded('Indirect dictionary values exceed the resolution depth limit.');
         }
-
-        $tokenOffset = (int) $match[0][1];
-        $dictionaryStart = strpos($body, '<<', $tokenOffset);
-        if ($dictionaryStart === false) {
-            return '';
-        }
-
-        $dictionary = $this->session->syntax->extractFirstDictionary(substr($body, $dictionaryStart));
-        if ($dictionary === null) {
-            return '';
-        }
-
-        return $dictionary;
-    }
-
-    /**
-     * @param array<int, PdfObject> $objects
-     * @param array<int, bool> $visited
-     */
-    private function resolveResourceObjectBody(int $objectId, array &$objects, array $visited): string
-    {
-        return $this->resolveIndirectObjectBody($objectId, $objects, $visited);
-    }
-
-    /**
-     * @param array<int, PdfObject> $objects
-     * @param array<int, bool> $visited
-     */
-    private function resolveIndirectObjectBody(int $objectId, array &$objects, array $visited, int $depth = 0): string
-    {
-        if ($depth > $this->options->maxRecursionDepth) {
-            throw PdfParseException::resourceLimitExceeded('Indirect object nesting exceeds maxRecursionDepth.');
-        }
-        if (isset($visited[$objectId]) || !$this->session->reader->ensureObject($objectId, $objects)) {
-            return '';
-        }
-
-        $visited[$objectId] = true;
-        $body = trim($objects[$objectId]->body);
-        if ($body === '') {
-            return '';
-        }
-
-        if (
-            str_starts_with($body, '<<') &&
-            str_contains($body, '>>')
-        ) {
-            return $body;
-        }
-
-        if (preg_match('/^(\d+)\s+\d+\s+R$/', $body, $refMatch) === 1) {
-            return $this->resolveIndirectObjectBody((int) $refMatch[1], $objects, $visited, $depth + 1);
-        }
-
-        return '';
+        $this->resolvingValues[$id] = true;
+        try { return $this->resolveIndirectObjectToken($id, $objects, []); }
+        finally { unset($this->resolvingValues[$id]); }
     }
 
     /**
@@ -404,23 +324,10 @@ final class ResourceResolver extends Subsystem
         }
 
         $map = [];
-        $xObjectDictionaries = [];
-
-        if (preg_match('/\/XObject\s*<<((?:[^>]|>(?!>))*+)>>/s', $resourceBody, $xObjectInlineMatch) === 1) {
-            $xObjectDictionaries[] = '<<' . $xObjectInlineMatch[1] . '>>';
-        }
-
-        if (preg_match('/\/XObject\s+(\d+)\s+\d+\s+R/', $resourceBody, $xObjectRefMatch) === 1) {
-            $xObjectBody = $this->resolveIndirectObjectBody((int) $xObjectRefMatch[1], $objects, []);
-            if ($xObjectBody !== '') {
-                $xObjectDictionaries[] = $xObjectBody;
-            }
-        }
-
-        foreach ($xObjectDictionaries as $xObjectDictionary) {
-            preg_match_all('/\/([^\s\/<>\[\]\(\)\{\}%]+)\s+(\d+)\s+\d+\s+R/', $xObjectDictionary, $refs, PREG_SET_ORDER);
-            foreach ($refs as $ref) {
-                $map[$this->session->encoding->decodePdfNameEscapes($ref[1])] = (int) $ref[2];
+        $dictionary = $this->resolveValue($this->session->syntax->dictionaryEntries($resourceBody)['XObject'] ?? '', $objects);
+        foreach ($this->session->syntax->dictionaryEntries($dictionary) as $name => $value) {
+            if (preg_match('/^(\d+)\s+\d+\s+R$/', $value, $ref) === 1) {
+                $map[$name] = (int) $ref[1];
             }
         }
 

@@ -185,6 +185,7 @@ $tests['optional stopword line breaks'] = static function (): void {
 };
 
 require __DIR__ . '/structure.php';
+require __DIR__ . '/production.php';
 
 $failed = 0;
 foreach ($tests as $name => $test) {

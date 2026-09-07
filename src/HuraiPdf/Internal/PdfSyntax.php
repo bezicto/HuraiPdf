@@ -69,6 +69,12 @@ final class PdfSyntax extends Subsystem
         }
     }
 
+    /** Decode a name value only; strings and dictionaries are not names. */
+    public function nameValue(string $value): string
+    {
+        return str_starts_with($value, '/') ? $this->session->encoding->decodePdfNameEscapes(substr($value, 1)) : '';
+    }
+
     public function stringBytes(string $value): ?string
     {
         $offset = 0;
@@ -164,6 +170,10 @@ final class PdfSyntax extends Subsystem
         }
 
         $start = $offset;
+        if (preg_match('/\G\d+\s+\d+\s+R\b/', $text, $ref, 0, $offset) === 1) {
+            $offset += strlen($ref[0]);
+            return $ref[0];
+        }
         $char = $text[$offset];
 
         if ($char === '<' && ($offset + 1) < $length && $text[$offset + 1] === '<') {
@@ -298,6 +308,13 @@ final class PdfSyntax extends Subsystem
      */
     public function readContentToken(string $content, int &$offset): ?array
     {
+        $this->context->contentTokenDepth++;
+        try { return $this->readContentTokenInternal($content, $offset); }
+        finally { $this->context->contentTokenDepth--; }
+    }
+
+    private function readContentTokenInternal(string $content, int &$offset): ?array
+    {
         $length = strlen($content);
 
         while (true) {
@@ -307,6 +324,8 @@ final class PdfSyntax extends Subsystem
                 return null;
             }
 
+            // Includes the token hash table, array slot and nested-array overhead.
+            $this->session->budget->reserveOperandBytes(512);
             $this->context->metrics['content_tokens']++;
             if ($this->context->metrics['content_tokens'] > $this->options->maxContentTokens) {
                 throw PdfParseException::resourceLimitExceeded('Content tokens exceed maxContentTokens.');
@@ -418,10 +437,12 @@ final class PdfSyntax extends Subsystem
                 if ($runLength > $this->options->maxStreamBytes - strlen($out)) {
                     throw PdfParseException::resourceLimitExceeded('String token exceeds maxStreamBytes.');
                 }
+                $this->session->budget->reserveOperandBytes(2 * $runLength);
                 $out .= substr($content, $offset, $runLength);
                 $offset += $runLength;
                 continue;
             }
+            $this->session->budget->reserveOperandBytes(2);
             $char = $content[$offset];
             $offset++;
 
@@ -517,6 +538,7 @@ final class PdfSyntax extends Subsystem
                 continue;
             }
 
+            $this->session->budget->reserveOperandBytes(2);
             $hex .= $char;
         }
 
@@ -551,6 +573,7 @@ final class PdfSyntax extends Subsystem
             $offset++;
         }
 
+        $this->session->budget->reserveOperandBytes(2 * ($offset - $start));
         return $this->session->encoding->decodePdfNameEscapes(substr($content, $start, $offset - $start));
     }
 
@@ -584,6 +607,7 @@ final class PdfSyntax extends Subsystem
             }
         }
 
+        $this->session->budget->reserveOperandBytes($offset - $start);
         $raw = substr($content, $start, $offset - $start);
         if ($raw === '' || $raw === '+' || $raw === '-' || $raw === '.') {
             return 0.0;
@@ -606,6 +630,7 @@ final class PdfSyntax extends Subsystem
             $offset++;
         }
 
+        $this->session->budget->reserveOperandBytes($offset - $start);
         return substr($content, $start, $offset - $start);
     }
 

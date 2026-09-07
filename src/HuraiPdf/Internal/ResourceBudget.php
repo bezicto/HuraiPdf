@@ -9,6 +9,16 @@ use HuraiPdf\Exception\PdfParseException;
 /** @internal */
 final class ResourceBudget extends Subsystem
 {
+    /** Charge before token arrays or string buffers are allocated. */
+    public function reserveOperandBytes(int $bytes): void
+    {
+        if ($this->context->contentTokenDepth === 0) { return; }
+        if ($bytes > $this->options->maxOperandBytes - $this->context->operandBytes) {
+            throw PdfParseException::resourceLimitExceeded('Content operands exceed maxOperandBytes.');
+        }
+        $this->context->operandBytes += $bytes;
+    }
+
     public function assertInputBudget(int $bytes): void
     {
         if ($bytes > $this->options->maxInputBytes) {

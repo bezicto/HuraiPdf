@@ -31,3 +31,10 @@ Security implementation references:
 
 Font encoding data sources and the Unicode permission notice are attached to
 `src/HuraiPdf/Font/EncodingTables.php`.
+
+Production regressions cover cumulative operand allocation across arrays, streams
+and nested Forms, release between operators/pages, and literal/hex string limits.
+The runner starts isolated PHP workers with a 64 MiB limit; it requires `proc_open`.
+Dictionary fixtures cover escaped keys/name values, string/comment/nested-dictionary
+decoys, indirect filters and predictor parameters, inherited resources, ToUnicode,
+and encoding Differences through memory, file, generator and recovery paths.

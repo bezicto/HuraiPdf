@@ -43,6 +43,8 @@ final class ParserOptions
         public readonly int $maxExtractedTextBytes = 32 * 1024 * 1024,
         /** Approximate retained cache allocation budget between pages. */
         public readonly int $maxCacheBytes = 8 * 1024 * 1024,
+        /** Conservative allocation budget for simultaneously retained content operands. */
+        public readonly int $maxOperandBytes = 16 * 1024 * 1024,
     ) {
         if ($this->streamingThreshold < 0) {
             throw new \InvalidArgumentException('streamingThreshold must be zero or greater.');
@@ -69,6 +71,7 @@ final class ParserOptions
                 'maxCMapEntries' => $this->maxCMapEntries,
                 'maxExtractedTextBytes' => $this->maxExtractedTextBytes,
                 'maxCacheBytes' => $this->maxCacheBytes,
+                'maxOperandBytes' => $this->maxOperandBytes,
             ] as $name => $value
         ) {
             if ($value < 1) {

@@ -246,7 +246,7 @@ final class XRefReader extends Subsystem
             'offsets' => $entries,
             'compressed' => [],
             'root_id' => $this->extractReferenceId($dictionary, 'Root'),
-            'encrypted' => preg_match('/\/Encrypt\b/', $dictionary) === 1,
+            'encrypted' => isset($this->session->syntax->dictionaryEntries($dictionary)['Encrypt']),
             'prev' => $this->extractIntegerValue($dictionary, 'Prev'),
             'xref_stream_offset' => $this->extractIntegerValue($dictionary, 'XRefStm'),
         ];
@@ -339,7 +339,7 @@ final class XRefReader extends Subsystem
             'trailer' => $this->session->syntax->dictionaryEntries($dictionary),
             'compressed' => $compressedEntries,
             'root_id' => $this->extractReferenceId($dictionary, 'Root'),
-            'encrypted' => preg_match('/\/Encrypt\b/', $dictionary) === 1,
+            'encrypted' => isset($this->session->syntax->dictionaryEntries($dictionary)['Encrypt']),
             'prev' => $this->extractIntegerValue($dictionary, 'Prev'),
             'xref_stream_offset' => null,
         ];
@@ -356,14 +356,14 @@ final class XRefReader extends Subsystem
 
     private function extractReferenceId(string $dictionary, string $key): ?int
     {
-        return preg_match('/\/' . preg_quote($key, '/') . '\s+(\d+)\s+\d+\s+R\b/', $dictionary, $match) === 1
+        return preg_match('/^(\d+)\s+\d+\s+R$/', $this->session->syntax->dictionaryEntries($dictionary)[$key] ?? '', $match) === 1
             ? (int) $match[1]
             : null;
     }
 
     private function extractIntegerValue(string $dictionary, string $key): ?int
     {
-        return preg_match('/\/' . preg_quote($key, '/') . '\s+(\d+)\b/', $dictionary, $match) === 1
+        return preg_match('/^([0-9]+)$/', $this->session->syntax->dictionaryEntries($dictionary)[$key] ?? '', $match) === 1
             ? (int) $match[1]
             : null;
     }
@@ -483,7 +483,7 @@ final class XRefReader extends Subsystem
         $prefix = $this->readFileRange($handle, $entry['offset'], min(4096, $length));
         $this->context->metrics['object_bytes_read'] += strlen($prefix);
         $dictionary = $this->session->syntax->extractFirstDictionary($prefix) ?? '';
-        if (($this->session->syntax->dictionaryEntries($dictionary)['Subtype'] ?? '') === '/Image') { return false; }
+        if ($this->session->syntax->nameValue($this->session->syntax->dictionaryEntries($dictionary)['Subtype'] ?? '') === 'Image') { return false; }
         if ($length > $this->options->maxObjectBytes) {
             throw PdfParseException::resourceLimitExceeded('PDF object exceeds maxObjectBytes.');
         }
@@ -499,7 +499,7 @@ final class XRefReader extends Subsystem
         }
         $bodyStart = strlen($header[0]);
         $dictionary = $this->session->syntax->extractFirstDictionary(substr($raw, $bodyStart)) ?? '';
-        if (preg_match('/\/Length\s+(\d+)\s+\d+\s+R\b/', $dictionary, $lengthRef) === 1) {
+        if (preg_match('/^(\d+)\s+\d+\s+R$/', $this->session->syntax->dictionaryEntries($dictionary)['Length'] ?? '', $lengthRef) === 1) {
             $this->loadObjectFromIndex((int) $lengthRef[1], $objects, $index, $handle, $warnings, $depth + 1);
         }
         $endOffset = $this->locateEndObjOffset($raw, $bodyStart, $objects);
@@ -550,8 +550,8 @@ final class XRefReader extends Subsystem
             }
             $dictionary = $this->session->syntax->extractFirstDictionary(substr($content, $bodyStart, min($end - $bodyStart, 65536))) ?? '';
             $entries = $this->session->syntax->dictionaryEntries($dictionary);
-            if (($entries['Subtype'] ?? '') === '/Image') { continue; }
-            if (($entries['Type'] ?? '') === '/XRef') {
+            if ($this->session->syntax->nameValue($entries['Subtype'] ?? '') === 'Image') { continue; }
+            if ($this->session->syntax->nameValue($entries['Type'] ?? '') === 'XRef') {
                 $this->context->trailerEntries = $entries + $this->context->trailerEntries;
             }
             $objects[$id] = new PdfObject($id, (int) $match[2][0], substr($content, $bodyStart, $end - $bodyStart), $match[1][1], false);
@@ -575,7 +575,7 @@ final class XRefReader extends Subsystem
         $this->context->objectGenerations[$object->id] = $object->generation;
         if ($this->context->security === null || $object->fromObjectStream || $object->id === $this->context->encryptionObjectId) { return $object; }
         $dictionary = $this->session->syntax->extractFirstDictionary($object->body) ?? '';
-        if (($this->session->syntax->dictionaryEntries($dictionary)['Type'] ?? '') === '/XRef') { return $object; }
+        if ($this->session->syntax->nameValue($this->session->syntax->dictionaryEntries($dictionary)['Type'] ?? '') === 'XRef') { return $object; }
         $body = $this->session->syntax->mapObjectStrings($object->body, function (string $bytes) use ($object, &$warnings): string {
             $plain = $this->context->security->decryptString($bytes, $object->id, $object->generation);
             if ($plain === false) {
@@ -643,7 +643,6 @@ final class XRefReader extends Subsystem
 
     private function extractDirectStreamLength(string $dictionary): ?int
     {
-        if (preg_match('/\/Length\s+\d+\s+\d+\s+R\b/', $dictionary) === 1) { return null; }
         return $this->extractIntegerValue($dictionary, 'Length');
     }
 
@@ -653,21 +652,9 @@ final class XRefReader extends Subsystem
      */
     public function expandObjectStreams(array &$objects, array &$warnings, ?array $index = null): void
     {
-        // Fast pre-check: avoid per-object regex when no ObjStm exists at all
-        $hasObjStm = false;
-        foreach ($objects as $obj) {
-            if (str_contains($obj->body, '/ObjStm')) {
-                $hasObjStm = true;
-                break;
-            }
-        }
-        if (!$hasObjStm) {
-            return;
-        }
-
         foreach ($objects as $containerObject) {
             $this->session->budget->guardDeadline();
-            if (!preg_match('/\/Type\s*\/ObjStm\b/', $containerObject->body)) {
+            if ($this->session->syntax->nameValue($this->session->syntax->dictionaryEntries($containerObject->body)['Type'] ?? '') !== 'ObjStm') {
                 continue;
             }
             if (isset($this->context->expandedObjectStreams[$containerObject->id])) {
@@ -685,7 +672,8 @@ final class XRefReader extends Subsystem
                 $streamInfo['dictionary'],
                 $streamInfo['stream'],
                 $warnings,
-                $containerObject->id
+                $containerObject->id,
+                objects: $objects
             );
 
             if ($decoded === '') {
@@ -694,8 +682,8 @@ final class XRefReader extends Subsystem
             }
 
             if (
-                preg_match('/\/N\s+(\d+)/', $streamInfo['dictionary'], $nMatch) !== 1 ||
-                preg_match('/\/First\s+(\d+)/', $streamInfo['dictionary'], $fMatch) !== 1
+                preg_match('/^(\d+)$/', $this->session->syntax->dictionaryEntries($streamInfo['dictionary'])['N'] ?? '', $nMatch) !== 1 ||
+                preg_match('/^(\d+)$/', $this->session->syntax->dictionaryEntries($streamInfo['dictionary'])['First'] ?? '', $fMatch) !== 1
             ) {
                 $this->session->budget->addWarning($warnings, 'Object stream ' . $containerObject->id . ' missing /N or /First.');
                 continue;
@@ -819,7 +807,7 @@ final class XRefReader extends Subsystem
      */
     private function resolveStreamLength(string $dictionary, array &$objects): ?int
     {
-        if (preg_match('/\/Length\s+(\d+)\s+(\d+)\s+R\b/', $dictionary, $refMatch) === 1) {
+        if (preg_match('/^(\d+)\s+(\d+)\s+R$/', $this->session->syntax->dictionaryEntries($dictionary)['Length'] ?? '', $refMatch) === 1) {
             $lengthObjectId = (int) $refMatch[1];
             if (!isset($objects[$lengthObjectId])) {
                 return null;
@@ -833,7 +821,7 @@ final class XRefReader extends Subsystem
             return null;
         }
 
-        if (preg_match('/\/Length\s+(\d+)\b/', $dictionary, $lengthMatch) === 1) {
+        if (preg_match('/^(\d+)$/', $this->session->syntax->dictionaryEntries($dictionary)['Length'] ?? '', $lengthMatch) === 1) {
             return (int) $lengthMatch[1];
         }
 

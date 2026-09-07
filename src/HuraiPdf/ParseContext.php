@@ -73,6 +73,8 @@ final class ParseContext
 
     public readonly int $startedAtNanoseconds;
 
+    public int $operandBytes = 0;
+    public int $contentTokenDepth = 0;
     public int $arrayDepth = 0;
     public int $arrayElements = 0;
     public int $cmapAllocationBytes = 0;

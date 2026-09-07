@@ -30,7 +30,7 @@ final class StandardSecurityHandler extends Subsystem
             return false;
         }
         $d = $this->session->syntax->dictionaryEntries($dictionary);
-        if (($d['Filter'] ?? '') !== '/Standard') { return false; }
+        if ($this->session->syntax->nameValue($d['Filter'] ?? '') !== 'Standard') { return false; }
         $this->revision = (int) ($d['R'] ?? 0);
         $version = (int) ($d['V'] ?? 0);
         if (!in_array([$this->revision, $version], [[2, 1], [3, 2], [4, 4], [5, 5], [6, 5]], true)) { return false; }
@@ -45,12 +45,12 @@ final class StandardSecurityHandler extends Subsystem
             $this->filters = ['Identity' => 'None'];
             foreach ($this->session->syntax->dictionaryEntries($d['CF'] ?? '') as $name => $filter) {
                 $cf = $this->session->syntax->dictionaryEntries($filter);
-                $method = ltrim($cf['CFM'] ?? '/None', '/');
+                $method = $this->session->syntax->nameValue($cf['CFM'] ?? '/None');
                 if (!in_array($method, $version === 5 ? ['None', 'AESV3'] : ['None', 'V2', 'AESV2'], true)) { return false; }
                 $this->filters[$name] = $method;
             }
-            $streamName = ltrim($d['StmF'] ?? '/Identity', '/');
-            $stringName = ltrim($d['StrF'] ?? '/Identity', '/');
+            $streamName = $this->session->syntax->nameValue($d['StmF'] ?? '/Identity');
+            $stringName = $this->session->syntax->nameValue($d['StrF'] ?? '/Identity');
             if (!isset($this->filters[$streamName], $this->filters[$stringName])) { return false; }
             $this->streamFilter = $this->filters[$streamName];
             $this->stringFilter = $this->filters[$stringName];
@@ -141,22 +141,27 @@ final class StandardSecurityHandler extends Subsystem
         return substr($hash, 0, 32);
     }
 
-    public function decryptStream(string $data, int $id, int $generation, string $dictionary): string|false
+    public function decryptStream(string $data, int $id, int $generation, string $dictionary, array &$objects = []): string|false
     {
         $d = $this->session->syntax->dictionaryEntries($dictionary);
-        if (($d['Type'] ?? '') === '/XRef' || (!$this->encryptMetadata && ($d['Type'] ?? '') === '/Metadata')) { return $data; }
+        $type = $this->session->syntax->nameValue($d['Type'] ?? '');
+        if ($type === 'XRef' || (!$this->encryptMetadata && $type === 'Metadata')) { return $data; }
         $method = $this->streamFilter;
-        $filters = ($d['Filter'][0] ?? '') === '['
-            ? $this->session->syntax->parsePdfArrayItems(substr($d['Filter'], 1, -1)) : [$d['Filter'] ?? ''];
-        $crypt = array_search('/Crypt', $filters, true);
+        $filter = $this->session->resources->resolveValue($d['Filter'] ?? '', $objects);
+        $filters = str_starts_with($filter, '[')
+            ? $this->session->syntax->parsePdfArrayItems(substr($filter, 1, -1)) : [$filter];
+        foreach ($filters as &$value) { $value = $this->session->syntax->nameValue($this->session->resources->resolveValue($value, $objects)); }
+        unset($value);
+        $crypt = array_search('Crypt', $filters, true);
         if ($crypt !== false) {
             // Crypt must be first in a filter pipeline, before decompression.
             if ($crypt !== 0) { return false; }
-            $parameters = $d['DecodeParms'] ?? '';
+            $parameters = $this->session->resources->resolveValue($d['DecodeParms'] ?? '', $objects);
             if (str_starts_with($parameters, '[')) {
                 $parameters = $this->session->syntax->parsePdfArrayItems(substr($parameters, 1, -1))[0] ?? '';
             }
-            $name = ltrim($this->session->syntax->dictionaryEntries($parameters)['Name'] ?? '/Identity', '/');
+            $parameters = $this->session->resources->resolveValue($parameters, $objects);
+            $name = $this->session->syntax->nameValue($this->session->resources->resolveValue($this->session->syntax->dictionaryEntries($parameters)['Name'] ?? '/Identity', $objects));
             $method = $this->filters[$name] ?? 'Unsupported';
         }
         return $this->decrypt($data, $id, $generation, $method);

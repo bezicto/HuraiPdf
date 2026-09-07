@@ -34,119 +34,39 @@ final class FontEncoding extends Subsystem
      */
     public function parseFontEncodingData(int $fontObjectId, string $fontBody, array &$objects): array
     {
-        $defaultEncodingName = $this->determineDefaultEncodingName($fontBody);
-        $encodingName = $defaultEncodingName;
+        $entries = $this->session->syntax->dictionaryEntries($fontBody);
+        $subtype = $this->session->syntax->nameValue($entries['Subtype'] ?? '');
+        $baseFont = strtolower($this->session->syntax->nameValue($entries['BaseFont'] ?? ''));
+        $encodingName = match (true) {
+            str_contains($baseFont, 'symbol') => 'SymbolEncoding',
+            str_contains($baseFont, 'zapfdingbats') => 'ZapfDingbatsEncoding',
+            $subtype === 'Type1' => 'StandardEncoding',
+            default => 'WinAnsiEncoding',
+        };
         $differences = [];
-        $isMultibyte = preg_match('/\/Subtype\s*\/Type0\b/', $fontBody) === 1;
-
-        if (preg_match('/\/Encoding\s*\/([A-Za-z0-9._-]+)/', $fontBody, $encodingNameMatch) === 1) {
-            $encodingName = $encodingNameMatch[1];
-        } elseif (preg_match('/\/Encoding\s*<<((?:[^>]|>(?!>))*+)>>/s', $fontBody, $encodingDictMatch) === 1) {
-            $parsed = $this->parseEncodingDictionaryBody('<<' . $encodingDictMatch[1] . '>>');
-            if ($parsed['base_encoding'] !== '') {
-                $encodingName = $parsed['base_encoding'];
-            }
-            $differences = $parsed['differences'];
-        } elseif (preg_match('/\/Encoding\s+(\d+)\s+\d+\s+R/', $fontBody, $encodingRefMatch) === 1) {
-            $encodingObjectBody = $this->session->resources->resolveIndirectObjectToken((int) $encodingRefMatch[1], $objects, []);
-            if ($encodingObjectBody !== '') {
-                if (preg_match('/^\/([A-Za-z0-9._-]+)$/', $encodingObjectBody, $encodingNameRefMatch) === 1) {
-                    $encodingName = $encodingNameRefMatch[1];
+        $encoding = $this->session->resources->resolveValue($entries['Encoding'] ?? '', $objects);
+        $name = $this->session->syntax->nameValue($encoding);
+        if ($name !== '') {
+            $encodingName = $name;
+        } elseif (str_starts_with($encoding, '<<')) {
+            $dictionary = $this->session->syntax->dictionaryEntries($encoding);
+            $base = $this->session->resources->resolveValue($dictionary['BaseEncoding'] ?? '', $objects);
+            $name = $this->session->syntax->nameValue($base);
+            if ($name !== '') { $encodingName = $name; }
+            $array = $this->session->resources->resolveValue($dictionary['Differences'] ?? '', $objects);
+            if (str_starts_with($array, '[')) {
+                $currentCode = null;
+                foreach ($this->session->syntax->parsePdfArrayItems(substr($array, 1, -1)) as $token) {
+                    if (preg_match('/^\d+$/', $token) === 1) {
+                        $currentCode = (int) $token;
+                    } elseif (($glyph = $this->session->syntax->nameValue($token)) !== '' && $currentCode !== null && $currentCode <= 255) {
+                        $differences[$currentCode++] = $glyph;
+                    }
                 }
-
-                $parsed = $this->parseEncodingDictionaryBody($encodingObjectBody);
-                if ($parsed['base_encoding'] !== '') {
-                    $encodingName = $parsed['base_encoding'];
-                }
-                $differences = $parsed['differences'];
             }
         }
-
-        if (
-            stripos($encodingName, 'Identity') !== false ||
-            preg_match('/\/CIDToGIDMap\b/', $fontBody) === 1
-        ) {
-            $isMultibyte = true;
-        }
-
-        if (preg_match('/\/Subtype\s*\/Type0\b/', $fontBody) === 1 && $encodingName === '') {
-            $encodingName = 'Identity';
-            $isMultibyte = true;
-        }
-
-        return [
-            'encoding_name' => $encodingName,
-            'differences' => $differences,
-            'is_multibyte' => $isMultibyte,
-        ];
-    }
-
-    private function determineDefaultEncodingName(string $fontBody): string
-    {
-        if (preg_match('/\/BaseFont\s*\/([^\\s\\/<>\\[\\]()]+)/', $fontBody, $baseFontMatch) === 1) {
-            $baseFont = strtolower($baseFontMatch[1]);
-            if (str_contains($baseFont, 'symbol')) {
-                return 'SymbolEncoding';
-            }
-            if (str_contains($baseFont, 'zapfdingbats')) {
-                return 'ZapfDingbatsEncoding';
-            }
-        }
-
-        if (preg_match('/\/Subtype\s*\/Type1\b/', $fontBody) === 1) {
-            return 'StandardEncoding';
-        }
-
-        return 'WinAnsiEncoding';
-    }
-
-    /**
-     * @return array{
-     *     base_encoding: string,
-     *     differences: array<int, string>
-     * }
-     */
-    private function parseEncodingDictionaryBody(string $encodingBody): array
-    {
-        $baseEncoding = '';
-        $differences = [];
-
-        if (preg_match('/\/BaseEncoding\s*\/([A-Za-z0-9._-]+)/', $encodingBody, $baseEncodingMatch) === 1) {
-            $baseEncoding = $baseEncodingMatch[1];
-        }
-
-        if (preg_match('/\/Differences\s*\[(.*?)\]/s', $encodingBody, $differencesMatch) === 1) {
-            $differences = $this->parseDifferencesArray($differencesMatch[1]);
-        }
-
-        return [
-            'base_encoding' => $baseEncoding,
-            'differences' => $differences,
-        ];
-    }
-
-    /**
-     * @return array<int, string>
-     */
-    private function parseDifferencesArray(string $differencesBody): array
-    {
-        $differences = [];
-        $currentCode = null;
-        $offset = 0;
-        $count = 0;
-        while (preg_match('/\/([^\s\/<>\[\]\(\)\{\}%]+)|(\d+)/', $differencesBody, $token, PREG_OFFSET_CAPTURE, $offset) === 1) {
-            if (++$count > $this->options->maxArrayElements) {
-                throw PdfParseException::resourceLimitExceeded('Encoding Differences exceeds maxArrayElements.');
-            }
-            if (($count & 255) === 0) { $this->session->budget->guardDeadline(); }
-            $offset = $token[0][1] + strlen($token[0][0]);
-            if (($token[2][0] ?? '') !== '') {
-                $currentCode = (int) $token[2][0];
-            } elseif (($token[1][0] ?? '') !== '' && $currentCode !== null && $currentCode <= 255) {
-                $differences[$currentCode++] = $this->decodePdfNameEscapes($token[1][0]);
-            }
-        }
-        return $differences;
+        $isMultibyte = $subtype === 'Type0' || stripos($encodingName, 'Identity') !== false || isset($entries['CIDToGIDMap']);
+        return ['encoding_name' => $encodingName, 'differences' => $differences, 'is_multibyte' => $isMultibyte];
     }
 
     public function decodePdfNameEscapes(string $name): string

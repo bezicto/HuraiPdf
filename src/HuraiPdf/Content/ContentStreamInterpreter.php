@@ -17,6 +17,13 @@ final class ContentStreamInterpreter extends Subsystem
      */
     public function extractPageText(int $pageObjectId, array &$objects, array &$warnings): string
     {
+        $base = $this->context->operandBytes;
+        try { return $this->extractPageTextInternal($pageObjectId, $objects, $warnings); }
+        finally { $this->context->operandBytes = $base; }
+    }
+
+    private function extractPageTextInternal(int $pageObjectId, array &$objects, array &$warnings): string
+    {
         if (!$this->session->reader->ensureObject($pageObjectId, $objects)) {
             return '';
         }
@@ -46,7 +53,8 @@ final class ContentStreamInterpreter extends Subsystem
                 $streamInfo['dictionary'],
                 $streamInfo['stream'],
                 $warnings,
-                $contentObjectId
+                $contentObjectId,
+                objects: $objects
             );
 
             if ($decodedStream === '') {
@@ -93,6 +101,8 @@ final class ContentStreamInterpreter extends Subsystem
     {
         $offset = 0;
         $length = strlen($contentStream);
+        $ownsState = $state === null;
+        $baseOperandBytes = $this->context->operandBytes - ($state['operand_bytes'] ?? 0);
         $state ??= ['inside' => false, 'font' => null, 'stack' => [], 'operands' => []];
         $operands = &$state['operands'];
         $parts = [];
@@ -101,166 +111,166 @@ final class ContentStreamInterpreter extends Subsystem
         $insideTextObject = &$state['inside'];
         $currentFont = &$state['font'];
 
-        while ($offset < $length) {
-            $token = $this->session->syntax->readContentToken($contentStream, $offset);
-            if ($token === null) {
-                break;
-            }
-
-            if ($token['type'] !== 'operator') {
-                if (count($operands) < 1024) {
-                    $operands[] = $token;
+        try {
+            while ($offset < $length) {
+                $token = $this->session->syntax->readContentToken($contentStream, $offset);
+                if ($token === null) {
+                    break;
                 }
-                continue;
-            }
 
-            $operator = $token['value'];
-            $this->context->metrics['content_operators']++;
-            if ($this->context->metrics['content_operators'] > $this->options->maxContentOperators) {
-                throw PdfParseException::resourceLimitExceeded('Content operators exceed maxContentOperators.');
-            }
-            if ((((int) $this->context->metrics['content_operators']) & 4095) === 0) {
-                $this->session->budget->guardDeadline();
-            }
+                if ($token['type'] !== 'operator') {
+                    if (count($operands) < 1024) {
+                        $operands[] = $token;
+                    }
+                    continue;
+                }
 
-            switch ($operator) {
-                case 'BI':
-                    $this->skipInlineImage($contentStream, $offset, $warnings);
-                    $operands = [];
-                    break;
-                case 'q':
-                    if (count($state['stack']) >= $this->options->maxRecursionDepth) {
-                        throw PdfParseException::resourceLimitExceeded('Graphics state exceeds maxRecursionDepth.');
-                    }
-                    $state['stack'][] = $currentFont;
-                    $operands = [];
-                    break;
-                case 'Q':
-                    if ($state['stack'] !== []) { $currentFont = array_pop($state['stack']); }
-                    $operands = [];
-                    break;
-                case 'BT':
-                    $insideTextObject = true;
-                    $operands = [];
-                    break;
-                case 'ET':
-                    $insideTextObject = false;
-                    $this->appendNewlineToArray($parts, $lastChar);
-                    $operands = [];
-                    break;
-                case 'Tj':
-                    if ($insideTextObject && $operands !== []) {
-                        $text = $this->tokenToText($operands[count($operands) - 1], $currentFont, $fontMaps);
-                        if ($text !== '') {
-                            $this->session->budget->appendTextPart($parts, $text);
-                            $lastChar = $text[strlen($text) - 1];
+                $operator = $token['value'];
+                $this->context->metrics['content_operators']++;
+                if ($this->context->metrics['content_operators'] > $this->options->maxContentOperators) {
+                    throw PdfParseException::resourceLimitExceeded('Content operators exceed maxContentOperators.');
+                }
+                if ((((int) $this->context->metrics['content_operators']) & 4095) === 0) {
+                    $this->session->budget->guardDeadline();
+                }
+
+                switch ($operator) {
+                    case 'BI':
+                        $this->skipInlineImage($contentStream, $offset, $warnings);
+                        break;
+                    case 'q':
+                        if (count($state['stack']) >= $this->options->maxRecursionDepth) {
+                            throw PdfParseException::resourceLimitExceeded('Graphics state exceeds maxRecursionDepth.');
                         }
-                    }
-                    $operands = [];
-                    break;
-                case 'TJ':
-                    if ($insideTextObject && $operands !== []) {
-                        $candidate = $operands[count($operands) - 1];
-                        if ($candidate['type'] === 'array') {
-                            $tjText = $this->extractTextFromTJArray($candidate['value'], $currentFont, $fontMaps);
-                            if ($tjText !== '') {
-                                $this->session->budget->appendTextPart($parts, $tjText);
-                                $lastChar = $tjText[strlen($tjText) - 1];
-                            }
-                        }
-                    }
-                    $operands = [];
-                    break;
-                case '\'':
-                    if ($insideTextObject) {
+                        $state['stack'][] = $currentFont;
+                        break;
+                    case 'Q':
+                        if ($state['stack'] !== []) { $currentFont = array_pop($state['stack']); }
+                        break;
+                    case 'BT':
+                        $insideTextObject = true;
+                        break;
+                    case 'ET':
+                        $insideTextObject = false;
                         $this->appendNewlineToArray($parts, $lastChar);
-                        if ($operands !== []) {
+                        break;
+                    case 'Tj':
+                        if ($insideTextObject && $operands !== []) {
                             $text = $this->tokenToText($operands[count($operands) - 1], $currentFont, $fontMaps);
                             if ($text !== '') {
                                 $this->session->budget->appendTextPart($parts, $text);
                                 $lastChar = $text[strlen($text) - 1];
                             }
                         }
-                    }
-                    $operands = [];
-                    break;
-                case '"':
-                    if ($insideTextObject) {
-                        $this->appendNewlineToArray($parts, $lastChar);
-                        if ($operands !== []) {
-                            $text = $this->tokenToText($operands[count($operands) - 1], $currentFont, $fontMaps);
-                            if ($text !== '') {
-                                $this->session->budget->appendTextPart($parts, $text);
-                                $lastChar = $text[strlen($text) - 1];
+                        break;
+                    case 'TJ':
+                        if ($insideTextObject && $operands !== []) {
+                            $candidate = $operands[count($operands) - 1];
+                            if ($candidate['type'] === 'array') {
+                                $tjText = $this->extractTextFromTJArray($candidate['value'], $currentFont, $fontMaps);
+                                if ($tjText !== '') {
+                                    $this->session->budget->appendTextPart($parts, $tjText);
+                                    $lastChar = $tjText[strlen($tjText) - 1];
+                                }
                             }
                         }
-                    }
-                    $operands = [];
-                    break;
-                case 'Tf':
-                    if ($operands !== []) {
-                        for ($i = count($operands) - 1; $i >= 0; $i--) {
-                            if ($operands[$i]['type'] === 'name') {
-                                $currentFont = (string) $operands[$i]['value'];
-                                break;
-                            }
-                        }
-                    }
-                    $operands = [];
-                    break;
-                case 'Td':
-                case 'TD':
-                    if ($insideTextObject) {
-                        // Only add a newline when the Y displacement is non-zero.
-                        // A zero Y value is a horizontal-only advance on the same
-                        // text line and must NOT break the word being assembled.
-                        $yOperand = 0.0;
-                        if (count($operands) >= 2) {
-                            $last = $operands[count($operands) - 1];
-                            if ($last['type'] === 'number') {
-                                $yOperand = (float) $last['value'];
-                            }
-                        }
-                        if (abs($yOperand) > 0.001) {
+                        break;
+                    case '\'':
+                        if ($insideTextObject) {
                             $this->appendNewlineToArray($parts, $lastChar);
+                            if ($operands !== []) {
+                                $text = $this->tokenToText($operands[count($operands) - 1], $currentFont, $fontMaps);
+                                if ($text !== '') {
+                                    $this->session->budget->appendTextPart($parts, $text);
+                                    $lastChar = $text[strlen($text) - 1];
+                                }
+                            }
                         }
-                    }
-                    $operands = [];
-                    break;
-                case 'T*':
-                case 'Tm':
-                    if ($insideTextObject) {
-                        $this->appendNewlineToArray($parts, $lastChar);
-                    }
-                    $operands = [];
-                    break;
-                case 'Do':
-                    $xObjectName = $this->extractLastNameOperand($operands);
-                    if ($xObjectName !== null) {
-                        $nestedText = $this->extractNestedFormXObjectText(
-                            $xObjectName,
-                            $xObjectMap,
-                            $fontMaps,
-                            $objects,
-                            $warnings,
-                            $formStack
-                        );
-                        if ($nestedText !== '') {
-                            if ($lastChar !== '' && $lastChar !== "\n") {
+                        break;
+                    case '"':
+                        if ($insideTextObject) {
+                            $this->appendNewlineToArray($parts, $lastChar);
+                            if ($operands !== []) {
+                                $text = $this->tokenToText($operands[count($operands) - 1], $currentFont, $fontMaps);
+                                if ($text !== '') {
+                                    $this->session->budget->appendTextPart($parts, $text);
+                                    $lastChar = $text[strlen($text) - 1];
+                                }
+                            }
+                        }
+                        break;
+                    case 'Tf':
+                        if ($operands !== []) {
+                            for ($i = count($operands) - 1; $i >= 0; $i--) {
+                                if ($operands[$i]['type'] === 'name') {
+                                    $currentFont = (string) $operands[$i]['value'];
+                                    break;
+                                }
+                            }
+                        }
+                        break;
+                    case 'Td':
+                    case 'TD':
+                        if ($insideTextObject) {
+                            // Only add a newline when the Y displacement is non-zero.
+                            // A zero Y value is a horizontal-only advance on the same
+                            // text line and must NOT break the word being assembled.
+                            $yOperand = 0.0;
+                            if (count($operands) >= 2) {
+                                $last = $operands[count($operands) - 1];
+                                if ($last['type'] === 'number') {
+                                    $yOperand = (float) $last['value'];
+                                }
+                            }
+                            if (abs($yOperand) > 0.001) {
                                 $this->appendNewlineToArray($parts, $lastChar);
                             }
-                            $this->session->budget->appendTextPart($parts, $nestedText);
-                            $lastChar = $nestedText[strlen($nestedText) - 1];
                         }
-                    }
-                    $operands = [];
-                    break;
-                default:
-                    $operands = [];
+                        break;
+                    case 'T*':
+                    case 'Tm':
+                        if ($insideTextObject) {
+                            $this->appendNewlineToArray($parts, $lastChar);
+                        }
+                        break;
+                    case 'Do':
+                        $xObjectName = $this->extractLastNameOperand($operands);
+                        if ($xObjectName !== null) {
+                            $nestedText = $this->extractNestedFormXObjectText(
+                                $xObjectName,
+                                $xObjectMap,
+                                $fontMaps,
+                                $objects,
+                                $warnings,
+                                $formStack
+                            );
+                            if ($nestedText !== '') {
+                                if ($lastChar !== '' && $lastChar !== "\n") {
+                                    $this->appendNewlineToArray($parts, $lastChar);
+                                }
+                                $this->session->budget->appendTextPart($parts, $nestedText);
+                                $lastChar = $nestedText[strlen($nestedText) - 1];
+                            }
+                        }
+                        break;
+                }
+                $operands = [];
+                unset($token, $candidate, $last, $xObjectName);
+                // Font names survive Tf and q/Q, so retain their allocation charge.
+                $retained = 2 * strlen($currentFont ?? '');
+                foreach ($state['stack'] as $font) { $retained += 512 + 2 * strlen($font ?? ''); }
+                unset($font);
+                if ($retained > $this->options->maxOperandBytes - $baseOperandBytes) {
+                    throw PdfParseException::resourceLimitExceeded('Content operands exceed maxOperandBytes.');
+                }
+                $this->context->operandBytes = $baseOperandBytes + $retained;
             }
-        }
 
-        return implode('', $parts);
+            return implode('', $parts);
+        } finally {
+            $state['operand_bytes'] = $this->context->operandBytes - $baseOperandBytes;
+            if ($ownsState) { $this->context->operandBytes = $baseOperandBytes; }
+        }
     }
 
     /** Skip inline image bytes without interpreting binary data as PDF operators. */
@@ -438,10 +448,8 @@ final class ContentStreamInterpreter extends Subsystem
         }
 
         $xObjectBody = $objects[$xObjectId]->body;
-        if (
-            preg_match('/\/Type\s*\/XObject\b/', $xObjectBody) !== 1 ||
-            preg_match('/\/Subtype\s*\/Form\b/', $xObjectBody) !== 1
-        ) {
+        $entries = $this->session->syntax->dictionaryEntries($xObjectBody);
+        if ($this->session->syntax->nameValue($entries['Subtype'] ?? '') !== 'Form') {
             return '';
         }
 
@@ -450,7 +458,7 @@ final class ContentStreamInterpreter extends Subsystem
             return '';
         }
 
-        $hasOwnResources = preg_match('/\/Resources\b/', $streamInfo['dictionary']) === 1;
+        $hasOwnResources = array_key_exists('Resources', $entries);
         if ($hasOwnResources && array_key_exists($xObjectId, $this->context->formTextCache)) {
             return $this->context->formTextCache[$xObjectId];
         }
@@ -460,7 +468,8 @@ final class ContentStreamInterpreter extends Subsystem
             $streamInfo['stream'],
             $warnings,
             $xObjectId,
-            !$hasOwnResources
+            !$hasOwnResources,
+            $objects
         );
         if ($decodedStream === '') {
             return '';
